@@ -55,9 +55,16 @@ function Assert-Admin {
     Write-Ok "Running as Administrator."
 }
 
+# Robust script directory resolver: prefer PSScriptRoot, then PSCommandPath, then current location
+function Get-ScriptDir {
+    if ($PSScriptRoot -and $PSScriptRoot.Trim().Length -gt 0) { return $PSScriptRoot }
+    if ($PSCommandPath -and $PSCommandPath.Trim().Length -gt 0) { return Split-Path -Parent $PSCommandPath }
+    try { return (Get-Location).ProviderPath } catch { return '.' }
+}
+
 # --- Small helper: simple logging to a file in the script directory
 function Write-Log([string]$msg) {
-    if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+    $scriptDir = Get-ScriptDir
     if (-not $logPath) { $logPath = Join-Path $scriptDir "Prepare-MSSQL-SourceForDMS.log" }
     $entry = "$(Get-Date -Format o) `t$msg"
     try { Add-Content -Path $logPath -Value $entry -ErrorAction Stop } catch { Write-Warn "Failed to write log: $_" }
@@ -66,7 +73,7 @@ function Write-Log([string]$msg) {
 # --- Test whether the database has already been prepared. Minimal, file-marker based.
 function Test-AlreadyConfigured {
     param([string]$DbName, [string]$Login)
-    if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+    $scriptDir = Get-ScriptDir
     $marker = Join-Path $scriptDir ".prepare_marker_$DbName"
     return Test-Path $marker
 }
@@ -509,7 +516,7 @@ Ensure-SqlAgent -InstanceName $PrimaryInstance
 
 Write-Log "SUCCESS: Configuration complete for DB: $($cred.Db)"
 # create a small marker file so subsequent runs can quickly detect completion
-if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$scriptDir = Get-ScriptDir
 $marker = Join-Path $scriptDir ".prepare_marker_$($cred.Db)"
 try { Set-Content -Path $marker -Value "Configured $($cred.Db) on $(Get-Date -Format o)" -Force } catch { Write-Warn "Unable to write marker file: $_" }
 
@@ -518,7 +525,7 @@ Write-Host "`n========================================" -ForegroundColor Yellow
 Write-Host "PHASE 2: Comprehensive Database Setup" -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Yellow
 
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = Get-ScriptDir
 $sqlScriptPath = Join-Path $scriptDir "Setup-DMS-Complete.sql"
 
 if (Test-Path $sqlScriptPath) {
