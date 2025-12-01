@@ -23,34 +23,10 @@ param(
 $ErrorActionPreference = "Stop"
 $PrimaryPort = 1433
 
-# Idempotency: Track what's already done
-$logPath = "$env:TEMP\DMS-Prepare-$(hostname)-$(Get-Date -Format 'yyyyMMdd').log"
-
 function Write-Info($msg) { Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "[OK]    $msg" -ForegroundColor Green }
 function Write-Warn($msg) { Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
 function Write-Fail($msg) { Write-Host "[FAIL]  $msg" -ForegroundColor Red }
-
-function Write-Log($msg) {
-    "$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | $msg" | Add-Content -Path $logPath
-}
-
-function Test-AlreadyConfigured {
-    param([string]$DbName, [string]$Login)
-    
-    Write-Info "Checking if already configured for DB '$DbName' with login '$Login'..."
-    
-    if (Test-Path $logPath) {
-        $lastEntry = Get-Content $logPath | Select-Object -Last 1
-        if ($lastEntry -match "SUCCESS: Configuration complete") {
-            $response = Read-Host "✓ Previous run found. Skip to Phase 2? (Y/N)" 
-            if ($response -ieq "Y" -or $response -ieq "YES") {
-                return $true
-            }
-        }
-    }
-    return $false
-}
 
 function Assert-Admin {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -305,18 +281,18 @@ END
 "@
     sqlcmd -S $server -E -Q $sqlDbCdc | Out-Null
     Write-Ok "CDC enabled on database."
-    sqlcmd -S $server -E -Q $sqlDbCdc | Out-Null
-    Write-Ok "CDC enabled on database."
 
     Write-Info "Enabling CDC on all user tables..."
     $sqlTablesCdc = @"
 USE [$DbName];
 DECLARE @schema sysname, @table sysname, @sql nvarchar(max);
+
 DECLARE cur CURSOR FAST_FORWARD FOR
 SELECT s.name, t.name
 FROM sys.tables t
 JOIN sys.schemas s ON t.schema_id = s.schema_id
 WHERE t.is_ms_shipped = 0;
+
 OPEN cur;
 FETCH NEXT FROM cur INTO @schema, @table;
 WHILE @@FETCH_STATUS = 0
@@ -328,7 +304,11 @@ BEGIN
         WHERE s2.name=@schema AND t2.name=@table
     )
     BEGIN
-        SET @sql = N'EXEC sys.sp_cdc_enable_table @source_schema = N''' + @schema + ''', @source_name = N''' + @table + ''', @role_name = NULL, @supports_net_changes = 0;';
+        SET @sql = N'EXEC sys.sp_cdc_enable_table
+            @source_schema = N''' + @schema + ''',
+            @source_name   = N''' + @table + ''',
+            @role_name     = NULL,
+            @supports_net_changes = 0;';
         EXEC sp_executesql @sql;
     END
     FETCH NEXT FROM cur INTO @schema, @table;
@@ -339,69 +319,8 @@ CLOSE cur; DEALLOCATE cur;
     Write-Ok "CDC enabled on all user tables."
 }
 
-function Invoke-SQL-Complete-Setup {
-    param(
-        [string]$SqlScriptPath,
-        [string]$PrimaryInstance,
-        [string]$DbName,
-        [string]$Login,
-        [string]$Password
-    )
-
-    Write-Host "`n`n========================================" -ForegroundColor Cyan
-    Write-Host "PHASE 2: Running Comprehensive SQL Setup" -ForegroundColor Cyan
-    Write-Host "========================================" -ForegroundColor Cyan
-    
-    # Check if SQL script exists
-    if (-not (Test-Path $SqlScriptPath)) {
-        Write-Warn "SQL script not found: $SqlScriptPath"
-        Write-Warn "Skipping automated SQL execution."
-        return $false
-    }
-
-    # Read the SQL script
-    $sqlContent = Get-Content -Path $SqlScriptPath -Raw
-
-    # Replace placeholder parameters with actual values
-    $sqlContent = $sqlContent -replace "@DatabaseName NVARCHAR\(128\) = N'[^']*'", "@DatabaseName NVARCHAR(128) = N'$DbName'"
-    $sqlContent = $sqlContent -replace "@DMSUsername NVARCHAR\(128\) = N'[^']*'", "@DMSUsername NVARCHAR(128) = N'$Login'"
-    
-    # For password, need to escape single quotes
-    $escapedPassword = $Password -replace "'", "''"
-    $sqlContent = $sqlContent -replace "@DMSPassword NVARCHAR\(256\) = N'[^']*'", "@DMSPassword NVARCHAR(256) = N'$escapedPassword'"
-
-    # Write updated SQL to temp file
-    $tempSqlPath = [System.IO.Path]::Combine($env:TEMP, "DMS-Setup-Temp-$((Get-Date).Ticks).sql")
-    $sqlContent | Set-Content -Path $tempSqlPath -Force
-
-    try {
-        Write-Info "Executing SQL setup script..."
-        $server = Get-ServerName $PrimaryInstance
-        
-        # Execute the SQL script via sqlcmd
-        sqlcmd -S $server -E -i $tempSqlPath | Out-Null
-        
-        Write-Ok "SQL setup completed successfully!"
-        return $true
-    } catch {
-        Write-Warn "SQL setup failed: $_"
-        Write-Warn "You can manually execute the SQL script:"
-        Write-Warn "  1. Open: $SqlScriptPath"
-        Write-Warn "  2. Edit parameters at the top"
-        Write-Warn "  3. Execute in SQL Server Management Studio"
-        return $false
-    } finally {
-        # Clean up temp file
-        if (Test-Path $tempSqlPath) {
-            Remove-Item -Path $tempSqlPath -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
 # ================= MAIN =================
 Assert-Admin
-
-Write-Info "DMS Setup Log: $logPath"
 
 $instData = Get-SqlInstances
 $instancesProps = $instData.Props
@@ -410,51 +329,32 @@ $instanceNames  = $instData.Names
 $PrimaryInstance = if ($instanceNames -contains "MSSQLSERVER") { "MSSQLSERVER" } else { $instanceNames[0] }
 Write-Ok "Primary instance: $PrimaryInstance"
 
-# Prompt for DB/login EARLY (needed for idempotency check)
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "PHASE 0: Database & Login Configuration" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-$cred = Prompt-ForDbAndLogin -PrimaryInstance $PrimaryInstance
-
-# Check if already configured
-$skipPhase1 = Test-AlreadyConfigured -DbName $cred.Db -Login $cred.Login
-
-if ($skipPhase1) {
-    Write-Ok "Skipping Phase 1 - Infrastructure Already Configured"
-    Write-Log "Skipped Phase 1 for DB: $($cred.Db), Login: $($cred.Login)"
-} else {
-    Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host "PHASE 1: Infrastructure & Services Setup" -ForegroundColor Cyan
-    Write-Host "========================================" -ForegroundColor Cyan
-    
-    # Configure network for all instances
-    foreach ($inst in $instanceNames) {
-        $instId = $instancesProps.$inst
-        Configure-Instance-Network -InstanceName $inst -InstanceId $instId -IsPrimary ($inst -eq $PrimaryInstance)
-    }
-
-    # Restart SQL services so TCP settings take effect
-    foreach ($inst in $instanceNames) {
-        Restart-Instance-Service -InstanceName $inst
-    }
-
-    # Enable remote access + mixed mode on each instance, restart primary at end
-    foreach ($inst in $instanceNames) {
-        $instId = $instancesProps.$inst
-        Enable-MixedModeAndRemoteAccess -InstanceName $inst -InstanceId $instId
-    }
-
-    Restart-Instance-Service -InstanceName $PrimaryInstance
-
-    # Firewall + browser + agent
-    Ensure-Firewall1433
-    Ensure-SqlBrowser
-    Ensure-SqlAgent -InstanceName $PrimaryInstance
-    
-    Write-Log "Phase 1 complete: Network, Services, Firewall configured"
+# Configure network for all instances
+foreach ($inst in $instanceNames) {
+    $instId = $instancesProps.$inst
+    Configure-Instance-Network -InstanceName $inst -InstanceId $instId -IsPrimary ($inst -eq $PrimaryInstance)
 }
 
-# ================= PHASE 1B: DATABASE CONFIGURATION =================
+# Restart SQL services so TCP settings take effect
+foreach ($inst in $instanceNames) {
+    Restart-Instance-Service -InstanceName $inst
+}
+
+# Enable remote access + mixed mode on each instance, restart primary at end
+foreach ($inst in $instanceNames) {
+    $instId = $instancesProps.$inst
+    Enable-MixedModeAndRemoteAccess -InstanceName $inst -InstanceId $instId
+}
+
+Restart-Instance-Service -InstanceName $PrimaryInstance
+
+# Firewall + browser + agent
+Ensure-Firewall1433
+Ensure-SqlBrowser
+Ensure-SqlAgent -InstanceName $PrimaryInstance
+
+# Prompt for DB/login and ensure it
+$cred = Prompt-ForDbAndLogin -PrimaryInstance $PrimaryInstance
 Ensure-LoginAndGrants -PrimaryInstance $PrimaryInstance -DbName $cred.Db -Login $cred.Login -Password $cred.Password
 
 # Grant DMS-specific permissions (VIEW SERVER STATE, VIEW ANY DEFINITION) required for CDC log reading
@@ -467,45 +367,8 @@ Set-RecoveryModel-And-Backup -PrimaryInstance $PrimaryInstance -DbName $cred.Db
 Enable-CDC-Database-And-Tables -PrimaryInstance $PrimaryInstance -DbName $cred.Db -Login $cred.Login -Password $cred.Password
 
 # Final restart to make agent/cdc clean
-if (-not $skipPhase1) {
-    Restart-Instance-Service -InstanceName $PrimaryInstance
-}
+Restart-Instance-Service -InstanceName $PrimaryInstance
 Ensure-SqlAgent -InstanceName $PrimaryInstance
-
-Write-Log "SUCCESS: Configuration complete for DB: $($cred.Db)"
-
-# ================= PHASE 2: RUN COMPREHENSIVE SQL SETUP =================
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "PHASE 2: Comprehensive Database Setup" -ForegroundColor Yellow
-Write-Host "========================================" -ForegroundColor Yellow
-
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$sqlScriptPath = Join-Path $scriptDir "Setup-DMS-Complete.sql"
-
-if (Test-Path $sqlScriptPath) {
-    Write-Info "Found SQL setup script: $sqlScriptPath"
-    Write-Host ""
-    
-    # Ask only if not skipped Phase 1 (or always allow re-running Phase 2)
-    $autoRun = Read-Host "Run SQL setup verification? (Y/N)" 
-    
-    if ($autoRun -ieq "Y" -or $autoRun -ieq "YES") {
-        Invoke-SQL-Complete-Setup -SqlScriptPath $sqlScriptPath `
-                                  -PrimaryInstance $PrimaryInstance `
-                                  -DbName $cred.Db `
-                                  -Login $cred.Login `
-                                  -Password $cred.Password
-        Write-Log "Phase 2 complete: SQL verification executed"
-    } else {
-        Write-Host "Manual SQL verification option available. Open in SSMS:" -ForegroundColor Yellow
-        Write-Host "  File: $sqlScriptPath"
-        Write-Host "  1. Customize parameters at the top"
-        Write-Host "  2. Execute (F5)"
-    }
-} else {
-    Write-Warn "SQL setup script not found: $sqlScriptPath"
-    Write-Warn "Expected location: $sqlScriptPath"
-}
 
 # ================= FINAL REPORT =================
 Write-Host "`n========== FINAL STATUS =========="
@@ -532,5 +395,3 @@ Write-Ok "`nDONE."
 Write-Host "DB Prepared : $($cred.Db)"
 Write-Host "Login       : $($cred.Login)"
 Write-Host "Connect via : Server=<this_machine_ip>,$PrimaryPort;Database=$($cred.Db);User Id=$($cred.Login);Password=***;"
-Write-Host "`nExecution log saved to: $logPath"
-Write-Host "To review: Get-Content '$logPath'"
