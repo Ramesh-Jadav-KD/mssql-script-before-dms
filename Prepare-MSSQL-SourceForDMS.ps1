@@ -365,14 +365,11 @@ function Grant-DmsUserPermissions {
 
     Write-Info "Granting VIEW SERVER STATE and VIEW ANY DEFINITION to $Login..."
     $sqlGrants = @"
-USE master;
-GO
 GRANT VIEW SERVER STATE TO [$Login];
-GO
 GRANT VIEW ANY DEFINITION TO [$Login];
-GO
 "@
-    sqlcmd -S $server -E -Q $sqlGrants | Out-Null
+    # Run the grants in the master database (server-scope permissions require master)
+    sqlcmd -S $server -E -d master -Q $sqlGrants | Out-Null
     Write-Ok "Permissions granted: VIEW SERVER STATE, VIEW ANY DEFINITION."
 }
 
@@ -803,18 +800,20 @@ PRINT '[' + CAST(@Step AS VARCHAR(1)) + '/7] Granting Server-Level Permissions..
 IF @GrantPermissions = 1
 BEGIN
     BEGIN TRY
-        SET @SQL = 'GRANT VIEW SERVER STATE TO [' + @DMSUsername + '];'
-        EXEC sys.sp_executesql @SQL
-        PRINT '  ✓ VIEW SERVER STATE granted'
+    -- Server-level permissions must be executed in the master database. Prepend USE master; so
+    -- the dynamic batch runs in master context and the GRANT succeeds.
+    SET @SQL = 'USE master; GRANT VIEW SERVER STATE TO [' + @DMSUsername + '];'
+    EXEC sys.sp_executesql @SQL
+    PRINT '  ✓ VIEW SERVER STATE granted'
     END TRY
     BEGIN CATCH
         PRINT '  ⚠ VIEW SERVER STATE: ' + ERROR_MESSAGE()
     END CATCH
     
     BEGIN TRY
-        SET @SQL = 'GRANT VIEW ANY DEFINITION TO [' + @DMSUsername + '];'
-        EXEC sys.sp_executesql @SQL
-        PRINT '  ✓ VIEW ANY DEFINITION granted'
+    SET @SQL = 'USE master; GRANT VIEW ANY DEFINITION TO [' + @DMSUsername + '];'
+    EXEC sys.sp_executesql @SQL
+    PRINT '  ✓ VIEW ANY DEFINITION granted'
     END TRY
     BEGIN CATCH
         PRINT '  ⚠ VIEW ANY DEFINITION: ' + ERROR_MESSAGE()
