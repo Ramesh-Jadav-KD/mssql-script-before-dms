@@ -1,3 +1,0 @@
--- NOTE: This SQL was moved into Prepare-MSSQL-SourceForDMS.ps1 as an embedded here-string.
--- The PowerShell script now supports `-InlineSql` to run Phase 2 without an external file.
--- If you still want the standalone .sql file, restore it from your repository history.

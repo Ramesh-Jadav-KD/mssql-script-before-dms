@@ -35,8 +35,7 @@ Example:
 #>
 
 param(
-    [string[]]$AllowedSubnets = @(),  # empty => allow any source
-    [switch]$InlineSql                 # if set, use the embedded SQL inside this .ps1 instead of external .sql file
+    [string[]]$AllowedSubnets = @()   # empty => allow any source
 )
 
 $ErrorActionPreference = "Stop"
@@ -576,7 +575,6 @@ Write-Host "`n========================================" -ForegroundColor Yellow
 Write-Host "PHASE 2: Comprehensive Database Setup" -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Yellow
 
-# Built-in copy of Setup-DMS-Complete.sql so users may run Phase 2 without an external file.
 $BuiltinSetupDmsSql = @'
 -- ============================================================================
 -- AWS DMS COMPLETE SETUP SCRIPT FOR MSSQL
@@ -862,15 +860,10 @@ PRINT '=================================================================='
 
 $scriptDir = Get-ScriptDir
 
-# decide whether to use external SQL file or embedded SQL (InlineSql switch)
-$createdTempSql = $false
-if ($InlineSql) {
-    $sqlScriptPath = Join-Path $env:TEMP ([System.IO.Path]::GetRandomFileName() + '.sql')
-    Set-Content -Path $sqlScriptPath -Value $BuiltinSetupDmsSql -Encoding UTF8 -Force
-    $createdTempSql = $true
-} else {
-    $sqlScriptPath = Join-Path $scriptDir "Setup-DMS-Complete.sql"
-}
+# Always use the embedded SQL (single-file mode) and write a temporary SQL file for execution
+$createdTempSql = $true
+$sqlScriptPath = Join-Path $env:TEMP ([System.IO.Path]::GetRandomFileName() + '.sql')
+Set-Content -Path $sqlScriptPath -Value $BuiltinSetupDmsSql -Encoding UTF8 -Force
 
 if (Test-Path $sqlScriptPath) {
     Write-Info "Found SQL setup script: $sqlScriptPath"
