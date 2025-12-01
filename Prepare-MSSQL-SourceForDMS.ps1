@@ -55,6 +55,41 @@ function Assert-Admin {
     Write-Ok "Running as Administrator."
 }
 
+# --- Small helper: simple logging to a file in the script directory
+function Write-Log([string]$msg) {
+    if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+    if (-not $logPath) { $logPath = Join-Path $scriptDir "Prepare-MSSQL-SourceForDMS.log" }
+    $entry = "$(Get-Date -Format o) `t$msg"
+    try { Add-Content -Path $logPath -Value $entry -ErrorAction Stop } catch { Write-Warn "Failed to write log: $_" }
+}
+
+# --- Test whether the database has already been prepared. Minimal, file-marker based.
+function Test-AlreadyConfigured {
+    param([string]$DbName, [string]$Login)
+    if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+    $marker = Join-Path $scriptDir ".prepare_marker_$DbName"
+    return Test-Path $marker
+}
+
+# --- Minimal invoker for the SQL verification script used in Phase 2
+function Invoke-SQL-Complete-Setup {
+    param(
+        [Parameter(Mandatory=$true)][string]$SqlScriptPath,
+        [Parameter(Mandatory=$true)][string]$PrimaryInstance,
+        [Parameter(Mandatory=$true)][string]$DbName,
+        [string]$Login,
+        [string]$Password
+    )
+    $server = Get-ServerName $PrimaryInstance
+    Write-Info "Executing SQL script: $SqlScriptPath against server: $server"
+    if ($Login -and $Password) {
+        sqlcmd -S $server -U $Login -P $Password -i $SqlScriptPath | Out-Null
+    } else {
+        sqlcmd -S $server -E -i $SqlScriptPath | Out-Null
+    }
+    Write-Log "Executed SQL verification script: $SqlScriptPath against $DbName"
+}
+
 function Get-SqlInstances {
     Write-Info "Detecting SQL Server instances..."
     $instRegPath = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL"
@@ -473,6 +508,10 @@ if (-not $skipPhase1) {
 Ensure-SqlAgent -InstanceName $PrimaryInstance
 
 Write-Log "SUCCESS: Configuration complete for DB: $($cred.Db)"
+# create a small marker file so subsequent runs can quickly detect completion
+if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$marker = Join-Path $scriptDir ".prepare_marker_$($cred.Db)"
+try { Set-Content -Path $marker -Value "Configured $($cred.Db) on $(Get-Date -Format o)" -Force } catch { Write-Warn "Unable to write marker file: $_" }
 
 # ================= PHASE 2: RUN COMPREHENSIVE SQL SETUP =================
 Write-Host "`n========================================" -ForegroundColor Yellow
