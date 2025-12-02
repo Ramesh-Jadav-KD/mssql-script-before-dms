@@ -66,6 +66,9 @@ function Get-ScriptDir {
     try { return (Get-Location).ProviderPath } catch { return '.' }
 }
 
+# Initialize script-scoped log path (defined after Get-ScriptDir exists)
+$script:logPath = Join-Path (Get-ScriptDir) "Prepare-MSSQL-SourceForDMS.log"
+
 # --- Small helper: simple logging to a file in the script directory
 function Write-Log([string]$msg) {
     $scriptDir = Get-ScriptDir
