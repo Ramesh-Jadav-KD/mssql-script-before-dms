@@ -606,7 +606,6 @@ Write-Host "DB Prepared : $($cred.Db)"
 Write-Host "Login       : $($cred.Login)"
 Write-Host "Connect via : Server=<this_machine_ip>,$PrimaryPort;Database=$($cred.Db);User Id=$($cred.Login);Password=***;"
 Write-Host "========================================" -ForegroundColor Cyan
-$cred = Prompt-ForDbAndLogin -PrimaryInstance $PrimaryInstance
 
 # Check if already configured
 $skipPhase1 = Test-AlreadyConfigured -DbName $cred.Db -Login $cred.Login
@@ -670,336 +669,67 @@ $scriptDir = Get-ScriptDir
 $marker = Join-Path $scriptDir ".prepare_marker_$($cred.Db)"
 try { Set-Content -Path $marker -Value "Configured $($cred.Db) on $(Get-Date -Format o)" -Force } catch { Write-Warn "Unable to write marker file: $_" }
 
-# ================= PHASE 2: RUN COMPREHENSIVE SQL SETUP =================
+# ================= PHASE 2: RUN COMPREHENSIVE SQL SETUP (external SQL file)
 Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "PHASE 2: Comprehensive Database Setup" -ForegroundColor Yellow
+Write-Host "PHASE 2: Comprehensive Database Setup (external SQL)" -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Yellow
 
-$BuiltinSetupDmsSql = @'
--- ============================================================================
--- AWS DMS COMPLETE SETUP SCRIPT FOR MSSQL
--- ============================================================================
--- ONE UNIFIED SCRIPT THAT DOES EVERYTHING:
---   ✓ Creates DMS login with password (dynamic)
---   ✓ Sets database recovery model to FULL
---   ✓ Takes full database backup
---   ✓ Enables CDC on database + all tables
---   ✓ Creates database user
---   ✓ Grants db_owner role
---   ✓ Grants DMS permissions (VIEW SERVER STATE, VIEW ANY DEFINITION)
---   ✓ Verifies all steps
---   ✓ Tests transaction log access
---
--- ============================================================================
--- CUSTOMIZE THESE PARAMETERS ONLY:
--- ============================================================================
-
-DECLARE @DatabaseName NVARCHAR(128) = N'tr8421';               -- Database to migrate
-DECLARE @DMSUsername NVARCHAR(128) = N'dms_final_user';        -- DMS login username
-DECLARE @DMSPassword NVARCHAR(256) = N'YourPassword123!@#';    -- DMS password
-DECLARE @BackupPath NVARCHAR(500) = N'NUL';                    -- Backup location (NUL = no file)
-
--- Execution flags (0 = skip, 1 = execute)
-DECLARE @CreateLogin BIT = 1;          -- Create DMS login if not exists
-DECLARE @EnableRecoveryFull BIT = 1;   -- Set database to FULL recovery
-DECLARE @TakeFullBackup BIT = 1;       -- Take full database backup
-DECLARE @EnableCDC BIT = 1;            -- Enable CDC on DB + tables
-DECLARE @GrantPermissions BIT = 1;     -- Grant DMS permissions
-
--- ============================================================================
--- END OF PARAMETERS - NO CHANGES BELOW THIS LINE
--- ============================================================================
-
-SET NOCOUNT ON;
-DECLARE @SQL NVARCHAR(MAX);
-DECLARE @Step INT = 0;
-
-PRINT ''
-PRINT '=================================================================='
-PRINT 'AWS DMS SETUP - COMPLETE CONFIGURATION'
-PRINT '=================================================================='
-PRINT 'Database: ' + @DatabaseName
-PRINT 'DMS User: ' + @DMSUsername
-PRINT 'Recovery: ' + CASE WHEN @EnableRecoveryFull = 1 THEN 'FULL' ELSE 'SKIP' END
-PRINT 'Backup: ' + CASE WHEN @TakeFullBackup = 1 THEN 'YES' ELSE 'SKIP' END
-PRINT 'CDC: ' + CASE WHEN @EnableCDC = 1 THEN 'YES' ELSE 'SKIP' END
-PRINT '=================================================================='
-PRINT ''
-
--- ============================================================================
--- STEP 1: CREATE DMS LOGIN
--- ============================================================================
-SET @Step = @Step + 1
-PRINT '[' + CAST(@Step AS VARCHAR(1)) + '/7] Creating DMS Login...'
-
-IF @CreateLogin = 1
-BEGIN
-    DECLARE @LoginExists BIT
-    SELECT @LoginExists = COUNT(*) FROM sys.server_principals 
-    WHERE name = @DMSUsername AND type_desc = 'SQL_LOGIN'
-    
-    IF @LoginExists = 0
-    BEGIN
-        SET @SQL = 'CREATE LOGIN [' + @DMSUsername + '] WITH PASSWORD = N''' + 
-                   REPLACE(@DMSPassword, '''', '''''') + 
-                   ''', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;'
-        EXEC sys.sp_executesql @SQL
-        PRINT '  ✓ Login created'
-    END
-    ELSE
-    BEGIN
-        PRINT '  ✓ Login already exists'
-    END
-END
-ELSE
-BEGIN
-    PRINT '  ⊘ Skipped'
-END
-PRINT ''
-
--- ============================================================================
--- STEP 2: SET DATABASE RECOVERY MODEL TO FULL
--- ============================================================================
-SET @Step = @Step + 1
-PRINT '[' + CAST(@Step AS VARCHAR(1)) + '/7] Setting Recovery Model to FULL...'
-
-IF @EnableRecoveryFull = 1
-BEGIN
-    SET @SQL = 'ALTER DATABASE [' + @DatabaseName + '] SET RECOVERY FULL;'
-    EXEC sys.sp_executesql @SQL
-    PRINT '  ✓ Recovery model set to FULL'
-END
-ELSE
-BEGIN
-    PRINT '  ⊘ Skipped'
-END
-PRINT ''
-
--- ============================================================================
--- STEP 3: TAKE FULL DATABASE BACKUP
--- ============================================================================
-SET @Step = @Step + 1
-PRINT '[' + CAST(@Step AS VARCHAR(1)) + '/7] Taking Full Database Backup...'
-
-IF @TakeFullBackup = 1
-BEGIN
-    BEGIN TRY
-        SET @SQL = 'BACKUP DATABASE [' + @DatabaseName + '] TO DISK = ''' + @BackupPath + ''';'
-        EXEC sys.sp_executesql @SQL
-        PRINT '  ✓ Backup completed'
-    END TRY
-    BEGIN CATCH
-        PRINT '  ⚠ Backup failed: ' + ERROR_MESSAGE()
-    END CATCH
-END
-ELSE
-BEGIN
-    PRINT '  ⊘ Skipped'
-END
-PRINT ''
-
--- ============================================================================
--- STEP 4: ENABLE CDC ON DATABASE
--- ============================================================================
-SET @Step = @Step + 1
-PRINT '[' + CAST(@Step AS VARCHAR(1)) + '/7] Enabling CDC on Database...'
-
-IF @EnableCDC = 1
-BEGIN
-    BEGIN TRY
-        SET @SQL = 'USE [' + @DatabaseName + ']; 
-                    IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = ''' + @DatabaseName + ''') = 0
-                    BEGIN
-                        EXEC sys.sp_cdc_enable_db;
-                    END'
-        EXEC sys.sp_executesql @SQL
-        PRINT '  ✓ CDC enabled on database'
-    END TRY
-    BEGIN CATCH
-        PRINT '  ⚠ CDC enable failed: ' + ERROR_MESSAGE()
-    END CATCH
-END
-ELSE
-BEGIN
-    PRINT '  ⊘ Skipped'
-END
-PRINT ''
-
--- ============================================================================
--- STEP 5: ENABLE CDC ON ALL USER TABLES
--- ============================================================================
-SET @Step = @Step + 1
-PRINT '[' + CAST(@Step AS VARCHAR(1)) + '/7] Enabling CDC on All Tables...'
-
-IF @EnableCDC = 1
-BEGIN
-    BEGIN TRY
-        SET @SQL = 'USE [' + @DatabaseName + '];
-                    DECLARE @schema SYSNAME, @table SYSNAME, @sql NVARCHAR(MAX), @count INT = 0;
-                    DECLARE cur CURSOR FAST_FORWARD FOR
-                    SELECT s.name, t.name FROM sys.tables t
-                    JOIN sys.schemas s ON t.schema_id = s.schema_id
-                    WHERE t.is_ms_shipped = 0;
-                    OPEN cur;
-                    FETCH NEXT FROM cur INTO @schema, @table;
-                    WHILE @@FETCH_STATUS = 0
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM cdc.change_tables ct
-                            JOIN sys.tables t2 ON ct.source_object_id=t2.object_id
-                            JOIN sys.schemas s2 ON t2.schema_id=s2.schema_id
-                            WHERE s2.name=@schema AND t2.name=@table
-                        )
-                        BEGIN
-                            SET @sql = N''EXEC sys.sp_cdc_enable_table
-                                @source_schema = N'''''' + @schema + '''''',
-                                @source_name = N'''''' + @table + '''''',
-                                @role_name = NULL,
-                                @supports_net_changes = 0;'';
-                            EXEC sp_executesql @sql;
-                            SET @count = @count + 1;
-                        END
-                        FETCH NEXT FROM cur INTO @schema, @table;
-                    END
-                    CLOSE cur; DEALLOCATE cur;'
-        EXEC sys.sp_executesql @SQL
-        PRINT '  ✓ CDC enabled on all tables'
-    END TRY
-    BEGIN CATCH
-        PRINT '  ⚠ Table CDC failed: ' + ERROR_MESSAGE()
-    END CATCH
-END
-ELSE
-BEGIN
-    PRINT '  ⊘ Skipped'
-END
-PRINT ''
-
--- ============================================================================
--- STEP 6: CREATE DATABASE USER & GRANT DB_OWNER
--- ============================================================================
-SET @Step = @Step + 1
-PRINT '[' + CAST(@Step AS VARCHAR(1)) + '/7] Creating Database User and Granting Permissions...'
-
-BEGIN TRY
-    SET @SQL = 'USE [' + @DatabaseName + '];
-                IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = ''' + @DMSUsername + ''')
-                    CREATE USER [' + @DMSUsername + '] FOR LOGIN [' + @DMSUsername + '];
-                ALTER ROLE [db_owner] ADD MEMBER [' + @DMSUsername + '];'
-    EXEC sys.sp_executesql @SQL
-    PRINT '  ✓ Database user created and db_owner granted'
-END TRY
-BEGIN CATCH
-    PRINT '  ⚠ User creation failed: ' + ERROR_MESSAGE()
-END CATCH
-PRINT ''
-
--- ============================================================================
--- STEP 7: GRANT DMS SERVER-LEVEL PERMISSIONS
--- ============================================================================
-SET @Step = @Step + 1
-PRINT '[' + CAST(@Step AS VARCHAR(1)) + '/7] Granting Server-Level Permissions...'
-
-IF @GrantPermissions = 1
-BEGIN
-    BEGIN TRY
-    -- Server-level permissions must be executed in the master database. Prepend USE master; so
-    -- the dynamic batch runs in master context and the GRANT succeeds.
-    SET @SQL = 'USE master; GRANT VIEW SERVER STATE TO [' + @DMSUsername + '];'
-    EXEC sys.sp_executesql @SQL
-    PRINT '  ✓ VIEW SERVER STATE granted'
-    END TRY
-    BEGIN CATCH
-        PRINT '  ⚠ VIEW SERVER STATE: ' + ERROR_MESSAGE()
-    END CATCH
-    
-    BEGIN TRY
-    SET @SQL = 'USE master; GRANT VIEW ANY DEFINITION TO [' + @DMSUsername + '];'
-    EXEC sys.sp_executesql @SQL
-    PRINT '  ✓ VIEW ANY DEFINITION granted'
-    END TRY
-    BEGIN CATCH
-        PRINT '  ⚠ VIEW ANY DEFINITION: ' + ERROR_MESSAGE()
-    END CATCH
-    
-    -- Verification: list server-level permissions for this principal
-    BEGIN TRY
-        SET @SQL = 'USE master; SELECT p.name AS principal_name, perm.permission_name FROM sys.server_permissions perm JOIN sys.server_principals p ON perm.grantee_principal_id = p.principal_id WHERE p.name = ''' + @DMSUsername + ''' AND perm.permission_name IN (''VIEW SERVER STATE'',''VIEW ANY DEFINITION'');'
-        EXEC sys.sp_executesql @SQL
-    END TRY
-    BEGIN CATCH
-        PRINT '  ⚠ Verification query failed: ' + ERROR_MESSAGE()
-    END CATCH
-END
-ELSE
-BEGIN
-    PRINT '  ⊘ Skipped'
-END
-PRINT ''
-
--- ============================================================================
--- VERIFICATION: TEST TRANSACTION LOG ACCESS
--- ============================================================================
-PRINT '=================================================================='
-PRINT 'VERIFICATION'
-PRINT '=================================================================='
-
-BEGIN TRY
-    SET @SQL = 'USE [' + @DatabaseName + ']; SELECT TOP 1 [Current LSN] FROM sys.fn_dblog(NULL, NULL);'
-    EXEC sys.sp_executesql @SQL
-    PRINT '✓✓✓ SUCCESS: All configuration complete! ✓✓✓'
-    PRINT ''
-    PRINT 'Next steps:'
-    PRINT '  1. Go to AWS DMS Console'
-    PRINT '  2. Click your task'
-    PRINT '  3. Click "Retry task"'
-    PRINT '  4. Monitor the Logs tab'
-    PRINT '  5. Should see "Starting full load..." message'
-END TRY
-BEGIN CATCH
-    PRINT '✗ Transaction log access failed: ' + ERROR_MESSAGE()
-    PRINT ''
-    PRINT 'Try manually running:'
-    PRINT '  USE master;'
-    PRINT '  GRANT VIEW SERVER STATE TO [' + @DMSUsername + '];'
-    PRINT '  GRANT VIEW ANY DEFINITION TO [' + @DMSUsername + '];'
-END CATCH
-
-PRINT ''
-PRINT '=================================================================='
-'@
-
 $scriptDir = Get-ScriptDir
+$sqlScriptPath = Join-Path $scriptDir 'Setup-DMS-Complete.sql'
 
-# Always use the embedded SQL (single-file mode) and write a temporary SQL file for execution
-$createdTempSql = $true
-$sqlScriptPath = Join-Path $env:TEMP ([System.IO.Path]::GetRandomFileName() + '.sql')
-Set-Content -Path $sqlScriptPath -Value $BuiltinSetupDmsSql -Encoding UTF8 -Force
+# If DMS username/password not provided via CLI, prompt now (secure)
+if (-not $DmsUsername) {
+    $entered = Read-Host "Enter DMS username to create (leave blank to skip creating a DMS login)"
+    if ($entered) { $DmsUsername = $entered }
+}
+if ($DmsUsername -and -not $DmsPassword) {
+    $dmsPwdSecure = Read-Host "Enter password for DMS user $DmsUsername" -AsSecureString
+    $DmsPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($dmsPwdSecure))
+}
 
-if (Test-Path $sqlScriptPath) {
+# If user requested, create the DMS server login now
+if ($DmsUsername -and $DmsPassword) {
+    Ensure-DmsServerLogin -PrimaryInstance $PrimaryInstance -DmsUser $DmsUsername -DmsPwd $DmsPassword -DbName $cred.Db -GrantSysadmin:$GrantSysadmin
+}
+
+# Ensure external SQL file exists; if not, create a template and ask user to edit/manage it
+if (-not (Test-Path $sqlScriptPath)) {
+    Write-Warn "External SQL file not found at: $sqlScriptPath"
+    $template = @'
+-- Setup-DMS-Complete.sql
+-- Template: override DECLARE variables at the top when running via the PowerShell script.
+-- DO NOT store production passwords in this file. Use the PowerShell prompt or a secure secrets store.
+
+-- Example DECLAREs (these will be prepended by the PowerShell wrapper if you run it):
+-- DECLARE @DatabaseName NVARCHAR(128) = N'tr8421';
+-- DECLARE @DMSUsername NVARCHAR(128) = N'dms_final_user';
+-- DECLARE @DMSPassword NVARCHAR(256) = N'YourPassword123!@#';
+-- DECLARE @BackupPath NVARCHAR(500) = N'NUL';
+
+-- Add your Phase 2 SQL logic below. Keep GO batch separators if needed.
+
+PRINT 'Template file created. Edit this file to customize Phase 2 SQL.'
+'@
+    Set-Content -Path $sqlScriptPath -Value $template -Encoding UTF8 -Force
+    Write-Host "A template file was created: $sqlScriptPath" -ForegroundColor Yellow
+    Write-Host "Edit the file and re-run the script, or run the file manually in SSMS after customizing the DECLAREs." -ForegroundColor Yellow
+} else {
     Write-Info "Found SQL setup script: $sqlScriptPath"
     Write-Host ""
-    
-    # Ask only if not skipped Phase 1 (or always allow re-running Phase 2)
-    $autoRun = Read-Host "Run SQL setup verification? (Y/N)" 
-    
-    if ($autoRun -ieq "Y" -or $autoRun -ieq "YES") {
+    $autoRun = Read-Host "Run SQL setup verification from external file now? (Y/N)"
+    if ($autoRun -ieq 'Y' -or $autoRun -ieq 'YES') {
         Invoke-SQL-Complete-Setup -SqlScriptPath $sqlScriptPath `
                                   -PrimaryInstance $PrimaryInstance `
                                   -DbName $cred.Db `
                                   -Login $cred.Login `
                                   -Password $cred.Password
-        Write-Log "Phase 2 complete: SQL verification executed"
-        if ($createdTempSql -and (Test-Path $sqlScriptPath)) { Remove-Item -Path $sqlScriptPath -Force -ErrorAction SilentlyContinue }
+        Write-Log "Phase 2 complete: external SQL verification executed"
     } else {
         Write-Host "Manual SQL verification option available. Open in SSMS:" -ForegroundColor Yellow
         Write-Host "  File: $sqlScriptPath"
-        Write-Host "  1. Customize parameters at the top"
-        Write-Host "  2. Execute (F5)"
+        Write-Host "  1. Customize parameters at the top or let the PowerShell wrapper inject them" -ForegroundColor Yellow
+        Write-Host "  2. Execute (F5)" -ForegroundColor Yellow
     }
-} else {
-    Write-Warn "SQL setup script not found: $sqlScriptPath"
-    Write-Warn "Expected location: $sqlScriptPath"
 }
 
 # ================= FINAL REPORT =================

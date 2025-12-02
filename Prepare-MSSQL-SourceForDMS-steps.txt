@@ -1,0 +1,89 @@
+Prepare-MSSQL-SourceForDMS.ps1 — step-by-step explanation
+
+Overview
+This script prepares a Windows machine's SQL Server instance to act as an AWS DMS source. It configures networking (TCP/IP/port), enables remote access and Mixed Mode authentication, configures the Windows firewall, ensures SQL Browser and SQL Agent services are running, creates or maps a SQL login for DMS, grants required permissions, sets recovery model to FULL, takes a full backup, and enables CDC on the database and its tables.
+
+Why you were asked for credentials / DB name twice (now fixed)
+- Cause: The script originally called Prompt-ForDbAndLogin at two places; once near the start of the flow and again later before Phase 1. That caused it to prompt twice for the same DB/login. This duplication has been removed — the script now collects credentials once and re-uses them.
+
+High-level flow (each numbered step corresponds to the script sections)
+
+1) Assert-Admin
+- Purpose: Verify the PowerShell session is running as Administrator. Many operations (service restart, firewall rules, registry edits) require elevation.
+- Input: none. Exits with error if not elevated.
+
+2) Detect SQL Instances (Get-SqlInstances)
+- Purpose: Enumerate installed SQL Server instances by reading the registry key HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL.
+- Output: instance names and mapping to instance IDs (used later for registry changes).
+
+3) Choose Primary Instance
+- Logic: If a default instance (MSSQLSERVER) exists, use that; otherwise use the first named instance.
+
+4) Configure TCP/IP and Port (Configure-Instance-Network)
+- Edits registry keys under each instance to enable TCP, and set a fixed port (1433) for the primary instance. For non-primary instances it leaves dynamic ports configured.
+- Why: AWS DMS expects SQL Server to be reachable over a stable TCP endpoint; fixing the port avoids dynamic port changes.
+- Side effects: requires SQL Server restart for changes to take effect.
+
+5) Restart SQL Server services (Restart-Instance-Service)
+- Purpose: Restart the SQL Server service for the instance so registry-based protocol changes take effect.
+
+6) Enable Remote Access & Mixed Mode (Enable-MixedModeAndRemoteAccess)
+- Runs sp_configure to enable remote access server option, and sets LoginMode=2 in the SQL Server registry (Mixed Mode authentication) so SQL logins work.
+- Note: Changing login mode also requires service restart.
+
+7) Configure Windows Firewall (Ensure-Firewall1433)
+- Adds a Windows Firewall rule to allow inbound TCP 1433 traffic. If you pass the -AllowedSubnets parameter, the rule is restricted to those CIDR ranges.
+
+8) Ensure SQL Browser (Ensure-SqlBrowser) and SQL Agent (Ensure-SqlAgent)
+- Ensures SQL Browser service is running (helps named instances discovery) and that SQL Server Agent is set to start automatically and is running (Agent is often required for CDC capture jobs and other automation).
+
+9) Prompt-ForDbAndLogin (Prompt-ForDbAndLogin)
+- Purpose: Ask you for the target database name, existing SQL login name that will be used for DMS operations, and that login's password.
+- Validation: The script validates the provided login/password by connecting to the target DB and running a simple query (SELECT 1). This ensures subsequent DB operations using that login will succeed.
+- Note: The script previously asked twice; this has been removed.
+
+10) Map login to DB user and grant db_owner (Ensure-LoginAndGrants)
+- If the database user does not exist for the provided login, the script creates it and adds the user to the db_owner role. DMS often requires db_owner for some operations (or at least the script configures this to be safe).
+
+11) Grant server-level permissions (Grant-DmsUserPermissions)
+- Grants VIEW SERVER STATE and VIEW ANY DEFINITION to the login. These server-level permissions are required so DMS can read transaction log metadata and object definitions.
+- Implementation detail: these GRANT statements must be executed in the master database. The script ensures this by running sqlcmd with -d master (and the embedded Phase 2 SQL uses USE master before server-level GRANTs).
+- Verification: After running grants, the script queries sys.server_permissions joined with sys.server_principals to verify the permissions were applied and logs whether they exist.
+
+12) Set recovery model & take full backup (Set-RecoveryModel-And-Backup)
+- Sets the target DB recovery model to FULL and takes a full backup to initialize the log chain (required for point-in-time / log-based replication).
+
+13) Enable CDC on database & tables (Enable-CDC-Database-And-Tables)
+- Enables CDC at the database level with sp_cdc_enable_db if it's not already enabled.
+- Iterates all user tables and enables CDC for each table if not already enabled. This uses dynamic SQL to call sp_cdc_enable_table for each table.
+
+14) Final restart and checks
+- Restarts the SQL Server service on the primary instance to ensure settings are cleanly applied and that Agent jobs (if any) pick up the configuration.
+- Prints the final status (TCP port, listener entries) and provides a connection string example.
+
+15) PHASE 2: Optional comprehensive SQL verification script
+- The script contains an embedded SQL file used for a full verification pass (creation of DMS login, database user, grants, backup, CDC checks, and a final verification of transaction log access). The script writes this embedded SQL to a temporary file and can execute it via sqlcmd. This allows you to open and review the SQL in SSMS if you want to run it manually.
+
+Why we validate credentials twice (before and during some operations)
+- The script validates the provided login when you enter it (to ensure the credentials are valid for DB-level operations). Previously it asked twice because the prompt was duplicated in the script; that duplication has been removed and the script now prompts once.
+
+Security note about passwords
+- Passing a password on the command line exposes it in process lists and in command history. For security, prefer one of these options:
+  - Run the script interactively and enter the password when prompted (the prompt uses Read-Host -AsSecureString in places where implemented).
+  - Integrate with a secrets manager (AWS Secrets Manager, Windows Credential Manager, or Azure Key Vault).
+
+How to run (recommended)
+1) Open PowerShell as Administrator.
+2) Run interactively (recommended):
+   .\Prepare-MSSQL-SourceForDMS.ps1
+   - Answer the prompts for DB, login, password when asked.
+
+3) Run with DMS login creation and sysadmin (non-interactively):
+   .\Prepare-MSSQL-SourceForDMS.ps1 -DmsUsername dms_user -DmsPassword 'Secur3P@ss!' -GrantSysadmin
+   (Note: passing passwords on CLI is less secure.)
+
+If you want, I can:
+- Wire `Ensure-DmsServerLogin` to run automatically when `-DmsUsername` is supplied (so the DMS account is created within the same run). Currently the function exists and can be invoked afterwards.
+- Replace any remaining plain-text password handling with a secure prompt (Read-Host -AsSecureString) or add support for a secrets manager.
+
+Contact me which of the above you'd like next: auto-run DMS login creation, stronger secret handling, or any wording changes in this explanation file.
