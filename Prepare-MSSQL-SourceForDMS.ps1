@@ -69,9 +69,10 @@ function Get-ScriptDir {
 # --- Small helper: simple logging to a file in the script directory
 function Write-Log([string]$msg) {
     $scriptDir = Get-ScriptDir
-    if (-not $logPath) { $logPath = Join-Path $scriptDir "Prepare-MSSQL-SourceForDMS.log" }
+    # Use script scope so other parts of the script can reference the path safely
+    if (-not $script:logPath) { $script:logPath = Join-Path $scriptDir "Prepare-MSSQL-SourceForDMS.log" }
     $entry = "$(Get-Date -Format o) `t$msg"
-    try { Add-Content -Path $logPath -Value $entry -ErrorAction Stop } catch { Write-Warn "Failed to write log: $_" }
+    try { Add-Content -Path $script:logPath -Value $entry -ErrorAction Stop } catch { Write-Warn "Failed to write log: $_" }
 }
 
 # --- Test whether the database has already been prepared. Minimal, file-marker based.
@@ -754,9 +755,11 @@ foreach ($inst in $instanceNames) {
 Write-Host "`nListener check for Primary Port ($PrimaryPort):"
 netstat -ano | findstr $PrimaryPort
 
-Write-Ok "`nDONE."
+Write-Host ""
+Write-Ok "DONE."
 Write-Host "DB Prepared : $($cred.Db)"
 Write-Host "Login       : $($cred.Login)"
 Write-Host "Connect via : Server=<this_machine_ip>,$PrimaryPort;Database=$($cred.Db);User Id=$($cred.Login);Password=***;"
-Write-Host "`nExecution log saved to: $logPath"
-Write-Host "To review: Get-Content '$logPath'"
+Write-Host ""
+Write-Host "Execution log saved to: $script:logPath"
+Write-Host "To review: Get-Content '$script:logPath'"
