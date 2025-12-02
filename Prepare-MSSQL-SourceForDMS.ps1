@@ -761,5 +761,5 @@ Write-Host "DB Prepared : $($cred.Db)"
 Write-Host "Login       : $($cred.Login)"
 Write-Host "Connect via : Server=<this_machine_ip>,$PrimaryPort;Database=$($cred.Db);User Id=$($cred.Login);Password=***;"
 Write-Host ""
-Write-Host "Execution log saved to: $script:logPath"
-Write-Host "To review: Get-Content '$script:logPath'"
+Write-Host "Execution log saved to:" $script:logPath
+Write-Host "To review: Get-Content" $script:logPath
