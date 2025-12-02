@@ -35,7 +35,11 @@ Example:
 #>
 
 param(
-    [string[]]$AllowedSubnets = @()   # empty => allow any source
+    [string[]]$AllowedSubnets = @(),   # empty => allow any source
+    [string]$DmsUsername = '',
+    [string]$DmsPassword = '',
+    [switch]$GrantSysadmin = $false,
+    [switch]$NonInteractive = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -369,8 +373,100 @@ GRANT VIEW SERVER STATE TO [$Login];
 GRANT VIEW ANY DEFINITION TO [$Login];
 "@
     # Run the grants in the master database (server-scope permissions require master)
-    sqlcmd -S $server -E -d master -Q $sqlGrants | Out-Null
-    Write-Ok "Permissions granted: VIEW SERVER STATE, VIEW ANY DEFINITION."
+    $grantOut = sqlcmd -S $server -E -d master -Q $sqlGrants 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Ok "Permissions granted: VIEW SERVER STATE, VIEW ANY DEFINITION."
+    } else {
+        Write-Warn "Grant execution returned non-zero exit code: $LASTEXITCODE"
+        Write-Warn $grantOut
+    }
+
+    # Verification: query server permissions for this principal to ensure grants exist
+    $verifySql = "SET NOCOUNT ON; SELECT p.name AS principal_name, perm.permission_name FROM sys.server_permissions perm JOIN sys.server_principals p ON perm.grantee_principal_id = p.principal_id WHERE p.name = N'$Login' AND perm.permission_name IN ('VIEW SERVER STATE','VIEW ANY DEFINITION');"
+    $verifyOut = sqlcmd -S $server -E -d master -Q $verifySql 2>&1 | Out-String
+    if ($verifyOut -match 'VIEW SERVER STATE' -and $verifyOut -match 'VIEW ANY DEFINITION') {
+        Write-Ok "Verification: both VIEW SERVER STATE and VIEW ANY DEFINITION present for $Login."
+    } elseif ($verifyOut -match 'VIEW SERVER STATE') {
+        Write-Warn "Verification: VIEW SERVER STATE present, VIEW ANY DEFINITION missing for $Login. Output:`n$verifyOut"
+    } elseif ($verifyOut -match 'VIEW ANY DEFINITION') {
+        Write-Warn "Verification: VIEW ANY DEFINITION present, VIEW SERVER STATE missing for $Login. Output:`n$verifyOut"
+    } else {
+        Write-Warn "Verification failed: no matching server-level permissions found for $Login. Output:`n$verifyOut"
+    }
+}
+
+# Ensure a server-level DMS login exists, optionally grant sysadmin, and map to the database
+function Ensure-DmsServerLogin {
+    param(
+        [string]$PrimaryInstance,
+        [string]$DmsUser,
+        [string]$DmsPwd,
+        [string]$DbName,
+        [switch]$GrantSysadmin
+    )
+
+    if (-not $DmsUser -or -not $DmsPwd) { Write-Warn "DMS username/password not provided, skipping DMS login creation."; return }
+
+    $server = Get-ServerName $PrimaryInstance
+    Write-Info "Ensuring DMS server login exists: $DmsUser (server: $server)"
+
+    # Escape single quotes for SQL literal
+    $safeUser = $DmsUser -replace "'", "''"
+    $safePwd  = $DmsPwd -replace "'", "''"
+    $safeDb   = $DbName -replace "'", "''"
+
+    $sql = @"
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'$safeUser' AND type_desc = 'SQL_LOGIN')
+BEGIN
+    CREATE LOGIN [$safeUser] WITH PASSWORD = N'$safePwd', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;
+    PRINT '  ✓ Login created: $safeUser';
+END
+ELSE
+BEGIN
+    PRINT '  ✓ Login already exists: $safeUser';
+END
+
+-- Grant server-level permissions (master context)
+GRANT VIEW SERVER STATE TO [$safeUser];
+GRANT VIEW ANY DEFINITION TO [$safeUser];
+
+-- Optionally add to sysadmin role
+IF $([convert]::ToInt32($([string]::IsNullOrEmpty(N'$GrantSysadmin') -eq $false))) = 1
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM sys.server_role_members rm JOIN sys.server_principals r ON rm.role_principal_id=r.principal_id JOIN sys.server_principals p ON rm.member_principal_id=p.principal_id WHERE r.name='sysadmin' AND p.name=N'$safeUser')
+    BEGIN
+        ALTER SERVER ROLE [sysadmin] ADD MEMBER [$safeUser];
+        PRINT '  ✓ Added to sysadmin role: $safeUser';
+    END
+    ELSE
+        PRINT '  ✓ Already member of sysadmin role: $safeUser';
+END
+
+-- Map to target database and ensure db_owner
+IF (DB_ID(N'$safeDb') IS NOT NULL)
+BEGIN
+    EXEC('USE [' + N'$safeDb' + ']; IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N''' + REPLACE(N'$safeUser','''','''''') + ''') BEGIN CREATE USER [' + N'$safeUser' + '] FOR LOGIN [' + N'$safeUser' + ']; END; ALTER ROLE [db_owner] ADD MEMBER [' + N'$safeUser' + '];');
+    PRINT '  ✓ Mapped to DB and granted db_owner where DB exists.';
+END
+ELSE
+BEGIN
+    PRINT '  ⚠ Target database not found for mapping: $safeDb';
+END
+"@
+
+    # Write to temporary file and execute in master context
+    $temp = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ([System.IO.Path]::GetRandomFileName() + '.sql'))
+    Set-Content -Path $temp -Value $sql -Encoding UTF8 -Force
+    try {
+        $out = sqlcmd -S $server -E -d master -i $temp 2>&1 | Out-String
+        Write-Log "Ensure-DmsServerLogin output: $out"
+        Write-Host $out
+    } catch {
+        Write-Warn "Failed to ensure DMS login: $_"
+        throw
+    } finally {
+        if (Test-Path $temp) { Remove-Item -Path $temp -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Enable-CDC-Database-And-Tables {
@@ -817,6 +913,15 @@ BEGIN
     END TRY
     BEGIN CATCH
         PRINT '  ⚠ VIEW ANY DEFINITION: ' + ERROR_MESSAGE()
+    END CATCH
+    
+    -- Verification: list server-level permissions for this principal
+    BEGIN TRY
+        SET @SQL = 'USE master; SELECT p.name AS principal_name, perm.permission_name FROM sys.server_permissions perm JOIN sys.server_principals p ON perm.grantee_principal_id = p.principal_id WHERE p.name = ''' + @DMSUsername + ''' AND perm.permission_name IN (''VIEW SERVER STATE'',''VIEW ANY DEFINITION'');'
+        EXEC sys.sp_executesql @SQL
+    END TRY
+    BEGIN CATCH
+        PRINT '  ⚠ Verification query failed: ' + ERROR_MESSAGE()
     END CATCH
 END
 ELSE
