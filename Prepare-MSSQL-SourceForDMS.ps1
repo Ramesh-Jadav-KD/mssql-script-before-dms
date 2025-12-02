@@ -700,7 +700,7 @@ if ($DmsUsername -and $DmsPassword) {
 # Ensure external SQL file exists; if not, create a template and ask user to edit/manage it
 if (-not (Test-Path $sqlScriptPath)) {
     Write-Warn "External SQL file not found at: $sqlScriptPath"
-    $template = @'
+$template = @"
 -- Setup-DMS-Complete.sql
 -- Template: override DECLARE variables at the top when running via the PowerShell script.
 -- DO NOT store production passwords in this file. Use the PowerShell prompt or a secure secrets store.
@@ -714,7 +714,7 @@ if (-not (Test-Path $sqlScriptPath)) {
 -- Add your Phase 2 SQL logic below. Keep GO batch separators if needed.
 
 PRINT 'Template file created. Edit this file to customize Phase 2 SQL.'
-'@
+"@
     Set-Content -Path $sqlScriptPath -Value $template -Encoding UTF8 -Force
     Write-Host "A template file was created: $sqlScriptPath" -ForegroundColor Yellow
     Write-Host "Edit the file and re-run the script, or run the file manually in SSMS after customizing the DECLAREs." -ForegroundColor Yellow
