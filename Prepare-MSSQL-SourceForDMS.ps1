@@ -430,22 +430,15 @@ END
 GRANT VIEW SERVER STATE TO [$safeUser];
 GRANT VIEW ANY DEFINITION TO [$safeUser];
 
--- Optionally add to sysadmin role
-IF $([convert]::ToInt32($([string]::IsNullOrEmpty(N'$GrantSysadmin') -eq $false))) = 1
-BEGIN
-    IF NOT EXISTS(SELECT 1 FROM sys.server_role_members rm JOIN sys.server_principals r ON rm.role_principal_id=r.principal_id JOIN sys.server_principals p ON rm.member_principal_id=p.principal_id WHERE r.name='sysadmin' AND p.name=N'$safeUser')
-    BEGIN
-        ALTER SERVER ROLE [sysadmin] ADD MEMBER [$safeUser];
-        PRINT '  ✓ Added to sysadmin role: $safeUser';
-    END
-    ELSE
-        PRINT '  ✓ Already member of sysadmin role: $safeUser';
-END
-
 -- Map to target database and ensure db_owner
 IF (DB_ID(N'$safeDb') IS NOT NULL)
 BEGIN
-    EXEC('USE [' + N'$safeDb' + ']; IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N''' + REPLACE(N'$safeUser','''','''''') + ''') BEGIN CREATE USER [' + N'$safeUser' + '] FOR LOGIN [' + N'$safeUser' + ']; END; ALTER ROLE [db_owner] ADD MEMBER [' + N'$safeUser' + '];');
+    USE [$safeDb];
+    IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'$safeUser')
+    BEGIN
+        CREATE USER [$safeUser] FOR LOGIN [$safeUser];
+    END
+    ALTER ROLE [db_owner] ADD MEMBER [$safeUser];
     PRINT '  ✓ Mapped to DB and granted db_owner where DB exists.';
 END
 ELSE
@@ -453,6 +446,11 @@ BEGIN
     PRINT '  ⚠ Target database not found for mapping: $safeDb';
 END
 "@
+
+    # Optionally append sysadmin block from PowerShell to avoid embedding PowerShell expressions in the here-string
+    if ($GrantSysadmin) {
+        $sql += "`r`nIF NOT EXISTS (SELECT 1 FROM sys.server_role_members rm JOIN sys.server_principals r ON rm.role_principal_id=r.principal_id JOIN sys.server_principals p ON rm.member_principal_id=p.principal_id WHERE r.name='sysadmin' AND p.name=N'$safeUser')\nBEGIN\n    ALTER SERVER ROLE [sysadmin] ADD MEMBER [$safeUser];\n    PRINT '  ✓ Added to sysadmin role: $safeUser';\nEND\nELSE\n    PRINT '  ✓ Already member of sysadmin role: $safeUser';\n"
+    }
 
     # Write to temporary file and execute in master context
     $temp = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ([System.IO.Path]::GetRandomFileName() + '.sql'))
