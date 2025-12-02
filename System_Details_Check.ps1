@@ -1,23 +1,32 @@
 <# 
-System_Details_Check.ps1 (No-admin-prompt version)
+System_Details_Check.ps1
+Enhanced version - checks ALL settings that Prepare-MSSQL-SourceForDMS.ps1 configures
 
 Creates:
   1) $env:USERPROFILE\Documents\System_details.txt
   2) $env:USERPROFILE\Documents\System_details.json
 
 Checks:
-- System configuration
+- System configuration (OS, RAM, etc.)
 - MSSQL installed or not
 - SQL versions and instance details
+- TCP/IP Enabled (registry)
+- TCP Port Configuration (static 1433 vs dynamic)
+- Mixed Mode Authentication enabled
+- SQL Browser service status
+- SQL Server Agent service status
+- Remote Access enabled
 - Credential login test
 - Database exists or not
-- Table list (cleaned)
-- CDC enabled on DB and tables (cleaned)
-- Remote access enabled or not
-- SQL Server Agent running or not
-- TCP 1433 listening or not
+- Recovery Model (FULL required for CDC)
+- User permissions (VIEW SERVER STATE, VIEW ANY DEFINITION)
+- User is db_owner in database
+- User is sysadmin (optional)
+- Table list
+- CDC enabled on DB and tables
+- TCP 1433 listening
 - Firewall inbound rule for 1433
-- VPN installed or not (apps + services + adapters)
+- VPN detection
 #>
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -55,15 +64,12 @@ function Get-RegistryUninstallApps {
 function Clean-SqlOutputLines {
     param([object]$raw)
     if ($null -eq $raw) { return @() }
-
     $lines = @()
     foreach ($item in @($raw)) {
         if ($null -eq $item) { continue }
         $s = $item.ToString().Trim()
-
         if ([string]::IsNullOrWhiteSpace($s)) { continue }
         if ($s -match "^\(\d+\s+rows?\s+affected\)$") { continue }
-
         $lines += $s
     }
     return $lines
@@ -171,16 +177,26 @@ function Get-SqlInstances {
     return @()
 }
 
+function Get-SqlInstanceId {
+    param([string]$InstanceName)
+    $instKey = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL"
+    if (Test-Path $instKey) {
+        return (Get-ItemProperty $instKey).$InstanceName
+    }
+    return $null
+}
+
 function Get-SqlVersionInfo {
     param([string[]]$instances)
     $info = @()
     foreach ($inst in $instances) {
-        $instId = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL").$inst
+        $instId = Get-SqlInstanceId -InstanceName $inst
         $setupKey = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instId\Setup"
         if (Test-Path $setupKey) {
             $p = Get-ItemProperty $setupKey
             $info += [PSCustomObject]@{
                 instance_name = $inst
+                instance_id   = $instId
                 edition       = $p.Edition
                 version       = $p.Version
                 patch_level   = $p.PatchLevel
@@ -244,10 +260,8 @@ function Escape-TsqlLiteral {
     return ($s -replace "'", "''")
 }
 
-# --- DB exists check using Windows auth ---
 function Test-DbExists-WindowsAuth {
     param([string]$ServerInstance, [string]$DbName)
-
     $dbEsc = Escape-TsqlLiteral $DbName
     try {
         $out = sqlcmd -S $ServerInstance -E -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name=N'$dbEsc';" -h -1 -W 2>&1
@@ -257,28 +271,7 @@ function Test-DbExists-WindowsAuth {
     catch { return $false }
 }
 
-# --- Ensure login, user, sysadmin + db_owner using Windows auth ---
 function Ensure-LoginAndGrants-WindowsAuth {
-    <#
-    Ensures a SQL login exists and a database user is mapped and granted appropriate DB role.
-
-    Parameters:
-      -ServerInstance  : SQL Server instance name
-      -DbName          : Target database name
-      -Login           : Login name to create/use
-      -Password        : Password for new login (only used when creating)
-      -MakeSysAdmin    : If $true, adds the login to sysadmin. Default $false.
-      -GrantDbOwner    : If $true, adds the DB user to db_owner. Default $true.
-
-    Behavior:
-      - Creates login if missing (with CHECK_POLICY/CHECK_EXPIRATION OFF)
-      - By default grants minimal server perms required for many read operations
-        (VIEW SERVER STATE and VIEW ANY DEFINITION). Use -MakeSysAdmin to add
-        to sysadmin instead.
-      - Creates the database user mapped to the login if missing and optionally
-        adds it to db_owner so it can enable CDC and perform schema operations.
-    #>
-
     param(
         [string]$ServerInstance,
         [string]$DbName,
@@ -291,73 +284,59 @@ function Ensure-LoginAndGrants-WindowsAuth {
     if ($null -eq $GrantDbOwner) { $GrantDbOwner = $true }
     if ($null -eq $MakeSysAdmin) { $MakeSysAdmin = $false }
 
-    # Escape literals safely for embedding into T-SQL string
     $l = Escape-TsqlLiteral $Login
     $p = Escape-TsqlLiteral $Password
     $db = Escape-TsqlLiteral $DbName
 
-    # Build server-level T-SQL to run in master for login creation and server perms
     $srvBlocks = @()
-
     $srvBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'$l')"
     $srvBlocks += "BEGIN"
     if ([string]::IsNullOrEmpty($Password)) {
-        # If no password supplied, create a login without password (Windows login) - but we expect SQL login
-        $srvBlocks += "    -- No password supplied; skipping CREATE LOGIN because password empty"
+        $srvBlocks += "    -- No password supplied; skipping CREATE LOGIN"
     } else {
-        $srvBlocks += "    CREATE LOGIN [" + $l + "] WITH PASSWORD = N'$p', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;"
+        $srvBlocks += "    CREATE LOGIN [$l] WITH PASSWORD = N'$p', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;"
     }
     $srvBlocks += "END"
 
     if ($MakeSysAdmin) {
         $srvBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.server_role_members rm JOIN sys.server_principals r ON rm.role_principal_id = r.principal_id JOIN sys.server_principals m ON rm.member_principal_id = m.principal_id WHERE r.name='sysadmin' AND m.name=N'$l')"
         $srvBlocks += "BEGIN"
-        $srvBlocks += "    ALTER SERVER ROLE [sysadmin] ADD MEMBER [" + $l + "];"
+        $srvBlocks += "    ALTER SERVER ROLE [sysadmin] ADD MEMBER [$l];"
         $srvBlocks += "END"
     }
     else {
-        # Grant minimal server-level permissions useful for discovery and CDC operations
         $srvBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.server_permissions sp JOIN sys.server_principals p ON sp.grantee_principal_id = p.principal_id WHERE p.name = N'$l' AND sp.permission_name = 'VIEW SERVER STATE')"
         $srvBlocks += "BEGIN"
-        $srvBlocks += "    GRANT VIEW SERVER STATE TO [" + $l + "];"
+        $srvBlocks += "    GRANT VIEW SERVER STATE TO [$l];"
         $srvBlocks += "END"
-
         $srvBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.server_permissions sp JOIN sys.server_principals p ON sp.grantee_principal_id = p.principal_id WHERE p.name = N'$l' AND sp.permission_name = 'VIEW ANY DEFINITION')"
         $srvBlocks += "BEGIN"
-        $srvBlocks += "    GRANT VIEW ANY DEFINITION TO [" + $l + "];"
+        $srvBlocks += "    GRANT VIEW ANY DEFINITION TO [$l];"
         $srvBlocks += "END"
     }
 
     $srvSql = ($srvBlocks -join "`r`n")
 
-    # Build DB-level T-SQL (run in the target DB)
     $dbBlocks = @()
     $dbBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'$l')"
     $dbBlocks += "BEGIN"
-    $dbBlocks += "    CREATE USER [" + $l + "] FOR LOGIN [" + $l + "];"
+    $dbBlocks += "    CREATE USER [$l] FOR LOGIN [$l];"
     $dbBlocks += "END"
     if ($GrantDbOwner) {
         $dbBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.database_role_members drm JOIN sys.database_principals r ON drm.role_principal_id = r.principal_id JOIN sys.database_principals m ON drm.member_principal_id = m.principal_id WHERE r.name = 'db_owner' AND m.name = N'$l')"
         $dbBlocks += "BEGIN"
-        $dbBlocks += "    ALTER ROLE [db_owner] ADD MEMBER [" + $l + "];"
+        $dbBlocks += "    ALTER ROLE [db_owner] ADD MEMBER [$l];"
         $dbBlocks += "END"
     }
-
     $dbSql = ($dbBlocks -join "`r`n")
 
-    # Make a safe USE [dbname] prefix (escape any ']' inside name by doubling)
     $safeDb = $DbName -replace ']', ']]'
-    $usePrefix = "USE [" + $safeDb + "];`r`n"
+    $usePrefix = "USE [$safeDb];`r`n"
     $dbSqlFull = $usePrefix + $dbSql
 
-    # Execute server-level block in master first, then DB-level block in the target DB
     try {
-        # run server-level in master
         sqlcmd -S $ServerInstance -E -d master -Q $srvSql | Out-Null
-
-        # run db-level by prefixing USE [dbname] to the batch (avoids -d quoting issues)
         sqlcmd -S $ServerInstance -E -Q $dbSqlFull | Out-Null
-
         return $true
     }
     catch {
@@ -366,11 +345,155 @@ function Ensure-LoginAndGrants-WindowsAuth {
     }
 }
 
+# ---------- NEW: TCP/IP and Network Configuration Checks ----------
+function Get-InstanceNetworkConfig {
+    param([string]$InstanceId)
+    
+    $result = [ordered]@{
+        tcp_enabled       = $false
+        tcp_port          = ""
+        dynamic_ports     = ""
+        port_type         = "UNKNOWN"
+    }
+    
+    $tcpReg = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$InstanceId\MSSQLServer\SuperSocketNetLib\Tcp"
+    $ipAllReg = "$tcpReg\IPAll"
+    
+    if (Test-Path $tcpReg) {
+        $tcpProps = Get-ItemProperty $tcpReg -ErrorAction SilentlyContinue
+        $result.tcp_enabled = ($tcpProps.Enabled -eq 1)
+    }
+    
+    if (Test-Path $ipAllReg) {
+        $ipAllProps = Get-ItemProperty $ipAllReg -ErrorAction SilentlyContinue
+        $result.tcp_port = $ipAllProps.TcpPort
+        $result.dynamic_ports = $ipAllProps.TcpDynamicPorts
+        
+        if ($result.tcp_port -and $result.tcp_port.Trim() -ne "") {
+            $result.port_type = "STATIC ($($result.tcp_port))"
+        } elseif ($result.dynamic_ports -and $result.dynamic_ports.Trim() -ne "") {
+            $result.port_type = "DYNAMIC"
+        } else {
+            $result.port_type = "NOT CONFIGURED"
+        }
+    }
+    
+    return $result
+}
+
+function Get-InstanceAuthMode {
+    param([string]$InstanceId)
+    
+    $secReg = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$InstanceId\MSSQLServer"
+    if (Test-Path $secReg) {
+        $props = Get-ItemProperty $secReg -ErrorAction SilentlyContinue
+        $loginMode = $props.LoginMode
+        switch ($loginMode) {
+            1 { return @{ mode = "Windows Only"; mixed_mode = $false } }
+            2 { return @{ mode = "Mixed Mode (SQL + Windows)"; mixed_mode = $true } }
+            default { return @{ mode = "UNKNOWN ($loginMode)"; mixed_mode = $false } }
+        }
+    }
+    return @{ mode = "UNKNOWN"; mixed_mode = $false }
+}
+
+function Get-ServiceStatus {
+    param([string]$ServiceName)
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc) {
+        return [ordered]@{
+            exists       = $true
+            status       = $svc.Status.ToString()
+            start_type   = $svc.StartType.ToString()
+            running      = ($svc.Status -eq "Running")
+        }
+    }
+    return [ordered]@{
+        exists       = $false
+        status       = "NOT FOUND"
+        start_type   = "N/A"
+        running      = $false
+    }
+}
+
+function Get-RecoveryModel {
+    param([string]$ServerInstance, [string]$User, [string]$Password, [string]$DbName)
+    try {
+        $q = "SELECT recovery_model_desc FROM sys.databases WHERE name = N'$(Escape-TsqlLiteral $DbName)';"
+        $result = Run-SqlQuery -ServerInstance $ServerInstance -User $User -Password $Password -Query $q
+        $clean = Clean-SqlOutputLines $result
+        if ($clean.Count -gt 0) { return $clean[0] }
+    } catch {}
+    return "UNKNOWN"
+}
+
+function Get-UserServerPermissions {
+    param([string]$ServerInstance, [string]$User, [string]$Password, [string]$LoginName)
+    $perms = @{
+        view_server_state   = $false
+        view_any_definition = $false
+        is_sysadmin         = $false
+    }
+    try {
+        $loginEsc = Escape-TsqlLiteral $LoginName
+        
+        # Check sysadmin
+        $sysadminQ = "SELECT COUNT(*) FROM sys.server_role_members rm JOIN sys.server_principals r ON rm.role_principal_id = r.principal_id JOIN sys.server_principals p ON rm.member_principal_id = p.principal_id WHERE r.name = 'sysadmin' AND p.name = N'$loginEsc';"
+        $sysadminRes = Run-SqlQuery -ServerInstance $ServerInstance -User $User -Password $Password -Query $sysadminQ
+        $sysadminClean = Clean-SqlOutputLines $sysadminRes
+        if ($sysadminClean.Count -gt 0 -and $sysadminClean[0] -gt 0) { $perms.is_sysadmin = $true }
+        
+        # Check VIEW SERVER STATE
+        $vssQ = "SELECT COUNT(*) FROM sys.server_permissions sp JOIN sys.server_principals p ON sp.grantee_principal_id = p.principal_id WHERE p.name = N'$loginEsc' AND sp.permission_name = 'VIEW SERVER STATE';"
+        $vssRes = Run-SqlQuery -ServerInstance $ServerInstance -User $User -Password $Password -Query $vssQ
+        $vssClean = Clean-SqlOutputLines $vssRes
+        if ($vssClean.Count -gt 0 -and $vssClean[0] -gt 0) { $perms.view_server_state = $true }
+        
+        # Check VIEW ANY DEFINITION
+        $vadQ = "SELECT COUNT(*) FROM sys.server_permissions sp JOIN sys.server_principals p ON sp.grantee_principal_id = p.principal_id WHERE p.name = N'$loginEsc' AND sp.permission_name = 'VIEW ANY DEFINITION';"
+        $vadRes = Run-SqlQuery -ServerInstance $ServerInstance -User $User -Password $Password -Query $vadQ
+        $vadClean = Clean-SqlOutputLines $vadRes
+        if ($vadClean.Count -gt 0 -and $vadClean[0] -gt 0) { $perms.view_any_definition = $true }
+    } catch {}
+    return $perms
+}
+
+function Get-UserDbRole {
+    param([string]$ServerInstance, [string]$User, [string]$Password, [string]$DbName, [string]$LoginName)
+    $roles = @{
+        user_exists  = $false
+        is_db_owner  = $false
+        roles        = @()
+    }
+    try {
+        $loginEsc = Escape-TsqlLiteral $LoginName
+        
+        # Check if user exists
+        $userQ = "SELECT COUNT(*) FROM sys.database_principals WHERE name = N'$loginEsc';"
+        $userRes = Run-SqlQuery -ServerInstance $ServerInstance -User $User -Password $Password -Database $DbName -Query $userQ
+        $userClean = Clean-SqlOutputLines $userRes
+        if ($userClean.Count -gt 0 -and $userClean[0] -gt 0) { $roles.user_exists = $true }
+        
+        # Check db_owner
+        $dboQ = "SELECT COUNT(*) FROM sys.database_role_members drm JOIN sys.database_principals r ON drm.role_principal_id = r.principal_id JOIN sys.database_principals m ON drm.member_principal_id = m.principal_id WHERE r.name = 'db_owner' AND m.name = N'$loginEsc';"
+        $dboRes = Run-SqlQuery -ServerInstance $ServerInstance -User $User -Password $Password -Database $DbName -Query $dboQ
+        $dboClean = Clean-SqlOutputLines $dboRes
+        if ($dboClean.Count -gt 0 -and $dboClean[0] -gt 0) { $roles.is_db_owner = $true }
+        
+        # Get all roles
+        $rolesQ = "SELECT r.name FROM sys.database_role_members drm JOIN sys.database_principals r ON drm.role_principal_id = r.principal_id JOIN sys.database_principals m ON drm.member_principal_id = m.principal_id WHERE m.name = N'$loginEsc';"
+        $rolesRes = Run-SqlQuery -ServerInstance $ServerInstance -User $User -Password $Password -Database $DbName -Query $rolesQ
+        $rolesClean = Clean-SqlOutputLines $rolesRes
+        $roles.roles = @($rolesClean)
+    } catch {}
+    return $roles
+}
+
 # ---------- Start ----------
-$Report = ""
+$script:Report = ""
 $JsonData = [ordered]@{}
 
-# Ask server instance first (needed to list DBs)
+# Ask server instance first
 $server = Read-Host "Enter SQL Server Instance (default: localhost)"
 if ([string]::IsNullOrWhiteSpace($server)) { $server = "localhost" }
 
@@ -380,7 +503,7 @@ Write-Host "Existing databases (Windows Auth):"
 try {
     sqlcmd -S $server -E -Q "SELECT name FROM sys.databases ORDER BY name;" 
 } catch {
-    Write-Host "Unable to list databases with Windows Authentication. You may not have admin rights."
+    Write-Host "Unable to list databases with Windows Authentication."
 }
 
 # Ask DB name until exists
@@ -402,14 +525,12 @@ $userCreated = $false
 $loginOK = $false
 
 if ($useExisting -match "^(y|yes)$") {
-
     $sqlUser = Read-Host "Enter existing SQL login name"
     $pwdSecure = Read-Host "Enter password" -AsSecureString
     $sqlPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pwdSecure)
     )
 
-    # Validate login (silent retry)
     do {
         try {
             Run-SqlQuery -ServerInstance $server -User $sqlUser -Password $sqlPass -Database $dbName -Query "SELECT 1;" | Out-Null
@@ -424,19 +545,15 @@ if ($useExisting -match "^(y|yes)$") {
             )
         }
     } while (-not $loginOK)
-
 } else {
-
     $sqlUser = Read-Host "Enter NEW login name to create"
     $pwdSecure = Read-Host "Enter NEW password" -AsSecureString
     $sqlPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pwdSecure)
     )
 
-    # Create login + grants using Windows auth
-    $userCreated = Ensure-LoginAndGrants-WindowsAuth -ServerInstance $server -DbName $dbName -Login $sqlUser -Password $sqlPass
+    $userCreated = Ensure-LoginAndGrants-WindowsAuth -ServerInstance $server -DbName $dbName -Login $sqlUser -Password $sqlPass -GrantDbOwner
 
-    # Validate new login
     try {
         Run-SqlQuery -ServerInstance $server -User $sqlUser -Password $sqlPass -Database $dbName -Query "SELECT 1;" | Out-Null
         $loginOK = $true
@@ -468,15 +585,14 @@ $JsonData.system_configuration = [ordered]@{
     manufacturer   = $cs.Manufacturer
     model          = $cs.Model
     ram_gb         = [math]::Round(($cs.TotalPhysicalMemory / 1GB), 2)
-    last_boot_time = $os.LastBootUpTime
+    last_boot_time = $os.LastBootUpTime.ToString("o")
 }
 
-# ---------- SQL SERVER Installation Checks ----------
+# ---------- SQL Server Installation ----------
 Section "SQL SERVER INSTALLATION"
 
 $instances = @(Get-SqlInstances)
 $sqlInstalled = ($instances.Count -gt 0)
-
 $verInfo = @()
 $yearsOnly = @()
 
@@ -485,14 +601,14 @@ if ($sqlInstalled) {
     $yearsOnly = @($verInfo.release_year | Sort-Object -Unique)
 }
 
-Write-ReportLine ("sql_server = {0}" -f (BoolText $sqlInstalled))
+Write-ReportLine ("SQL Server Installed? : {0}" -f (BoolText $sqlInstalled))
 
 if ($yearsOnly.Count -eq 0) {
-    Write-ReportLine "sql_server_version = UNKNOWN"
+    Write-ReportLine "SQL Server Version    : UNKNOWN"
 } elseif ($yearsOnly.Count -eq 1) {
-    Write-ReportLine ("sql_server_version = {0}" -f $yearsOnly[0])
+    Write-ReportLine ("SQL Server Version    : {0}" -f $yearsOnly[0])
 } else {
-    Write-ReportLine ("sql_server_version = {0}" -f ($yearsOnly -join ", "))
+    Write-ReportLine ("SQL Server Version    : {0}" -f ($yearsOnly -join ", "))
 }
 
 if ($sqlInstalled) {
@@ -503,128 +619,95 @@ if ($sqlInstalled) {
     Write-ReportLine ""
     Write-ReportLine "Instance Version Details:"
     foreach ($v in $verInfo) {
-        Write-ReportLine ("  Instance: {0} | Edition: {1} | Version: {2} | Patch: {3} | Release: {4}" -f `
-            $v.instance_name, $v.edition, $v.version, $v.patch_level, $v.release_name)
+        Write-ReportLine ("  Instance: {0} | Edition: {1} | Version: {2} | Patch: {3} | Release: {4}" -f $v.instance_name, $v.edition, $v.version, $v.patch_level, $v.release_name)
     }
 }
 
 $JsonData.sql_server_installation = [ordered]@{
-    sql_server           = $(if ($sqlInstalled) { "yes" } else { "no" })
+    sql_server_installed = $sqlInstalled
     sql_server_version   = $(if ($yearsOnly.Count -eq 1) { $yearsOnly[0] } else { @($yearsOnly) })
     sql_server_instances = @($verInfo)
 }
 
-# ---------- SQL LOGIN / DATABASE CHECKS ----------
-Section "SQL LOGIN / DATABASE CHECKS"
-Write-ReportLine ("Login Successful? : {0}" -f (BoolText $loginOK))
-Write-ReportLine ("Database Exists?  : {0}" -f (BoolText $dbExists))
-Write-ReportLine ("User Created?     : {0}" -f (BoolText $userCreated))
+# ---------- SQL Server Network Configuration (TCP/IP, Mixed Mode) ----------
+Section "SQL SERVER NETWORK CONFIGURATION"
 
-$tablesList = @()
-$cdcDb = $false
-$cdcTableDetails = @()
+$instanceNetworkConfigs = @()
 
-if ($loginOK -and $dbExists) {
+foreach ($inst in $instances) {
+    $instId = Get-SqlInstanceId -InstanceName $inst
+    $netConfig = Get-InstanceNetworkConfig -InstanceId $instId
+    $authMode = Get-InstanceAuthMode -InstanceId $instId
+    
     Write-ReportLine ""
-    Write-ReportLine "Tables:"
-    try {
-        $tq = @"
-SELECT s.name + '.' + t.name
-FROM sys.tables t
-JOIN sys.schemas s ON t.schema_id = s.schema_id
-ORDER BY s.name, t.name;
-"@
-        $tablesRaw = Run-SqlQuery -ServerInstance $server -User $sqlUser -Password $sqlPass -Database $dbName -Query $tq
-        $tablesClean = Clean-SqlOutputLines $tablesRaw
-
-        if ($tablesClean.Count -eq 0) {
-            Write-ReportLine "  (No tables found)"
-        } else {
-            foreach ($t in $tablesClean) {
-                Write-ReportLine ("  Table Name: {0}" -f $t)
-                $tablesList += $t
-            }
-        }
-    } catch {
-        Write-ReportLine "  (Failed to list tables)"
-    }
-
-    try {
-        $cdcQ = "SELECT is_cdc_enabled FROM sys.databases WHERE name='$dbName';"
-        $cdcRes = Run-SqlQuery -ServerInstance $server -User $sqlUser -Password $sqlPass -Query $cdcQ
-        $cdcResClean = Clean-SqlOutputLines $cdcRes
-        if ($cdcResClean -match "1") { $cdcDb = $true }
-    } catch { $cdcDb = $false }
-
-    Write-ReportLine ""
-    Write-ReportLine ("CDC Enabled on Database? : {0}" -f (BoolText $cdcDb))
-
-    Write-ReportLine ""
-    Write-ReportLine "CDC Enabled per Table:"
-    try {
-        $cdcTQ = @"
-SELECT s.name + '.' + t.name AS TableName,
-       t.is_tracked_by_cdc
-FROM sys.tables t
-JOIN sys.schemas s ON t.schema_id = s.schema_id
-ORDER BY TableName;
-"@
-        $cdcRaw = Run-SqlQuery -ServerInstance $server -User $sqlUser -Password $sqlPass -Database $dbName -Query $cdcTQ
-        $cdcClean = Clean-SqlOutputLines $cdcRaw
-
-        if ($cdcClean.Count -eq 0) {
-            Write-ReportLine "  (No tables found)"
-        } else {
-            foreach ($row in $cdcClean) {
-                $parts = $row -split ","
-                if ($parts.Count -ge 2) {
-                    $tname = $parts[0].Trim()
-                    $enabled = ($parts[1].Trim() -eq "1")
-                    Write-ReportLine ("  Table Name: {0} | CDC Enabled: {1}" -f $tname, (BoolText $enabled))
-
-                    $cdcTableDetails += [ordered]@{
-                        table_name  = $tname
-                        cdc_enabled = $enabled
-                    }
-                }
-            }
-        }
-    } catch {
-        Write-ReportLine "  (Failed to check CDC per table)"
+    Write-ReportLine "Instance: $inst"
+    Write-ReportLine ("  TCP/IP Enabled?      : {0}" -f (BoolText $netConfig.tcp_enabled))
+    Write-ReportLine ("  TCP Port             : {0}" -f $netConfig.tcp_port)
+    Write-ReportLine ("  Dynamic Ports        : {0}" -f $netConfig.dynamic_ports)
+    Write-ReportLine ("  Port Type            : {0}" -f $netConfig.port_type)
+    Write-ReportLine ("  Authentication Mode  : {0}" -f $authMode.mode)
+    Write-ReportLine ("  Mixed Mode Enabled?  : {0}" -f (BoolText $authMode.mixed_mode))
+    
+    $instanceNetworkConfigs += [ordered]@{
+        instance_name       = $inst
+        instance_id         = $instId
+        tcp_enabled         = $netConfig.tcp_enabled
+        tcp_port            = $netConfig.tcp_port
+        dynamic_ports       = $netConfig.dynamic_ports
+        port_type           = $netConfig.port_type
+        authentication_mode = $authMode.mode
+        mixed_mode_enabled  = $authMode.mixed_mode
     }
 }
 
-$JsonData.sql_login_database_checks = [ordered]@{
-    login_successful        = $loginOK
-    database_exists         = $dbExists
-    tables                  = @($tablesList)
-    cdc_enabled_on_database = $cdcDb
-    cdc_enabled_on_tables   = @($cdcTableDetails)
+$JsonData.sql_network_configuration = @($instanceNetworkConfigs)
+
+# ---------- SQL Services Status ----------
+Section "SQL SERVICES STATUS"
+
+# SQL Server service
+$primaryInstance = if ($instances -contains "MSSQLSERVER") { "MSSQLSERVER" } else { $instances[0] }
+$sqlSvcName = if ($primaryInstance -eq "MSSQLSERVER") { "MSSQLSERVER" } else { "MSSQL`$$primaryInstance" }
+$sqlSvcStatus = Get-ServiceStatus -ServiceName $sqlSvcName
+
+Write-ReportLine ("SQL Server Service ({0}):" -f $sqlSvcName)
+Write-ReportLine ("  Exists?    : {0}" -f (BoolText $sqlSvcStatus.exists))
+Write-ReportLine ("  Status     : {0}" -f $sqlSvcStatus.status)
+Write-ReportLine ("  Start Type : {0}" -f $sqlSvcStatus.start_type)
+Write-ReportLine ("  Running?   : {0}" -f (BoolText $sqlSvcStatus.running))
+
+# SQL Agent service
+$agentSvcName = if ($primaryInstance -eq "MSSQLSERVER") { "SQLSERVERAGENT" } else { "SQLAgent`$$primaryInstance" }
+$agentSvcStatus = Get-ServiceStatus -ServiceName $agentSvcName
+
+Write-ReportLine ""
+Write-ReportLine ("SQL Server Agent ({0}):" -f $agentSvcName)
+Write-ReportLine ("  Exists?    : {0}" -f (BoolText $agentSvcStatus.exists))
+Write-ReportLine ("  Status     : {0}" -f $agentSvcStatus.status)
+Write-ReportLine ("  Start Type : {0}" -f $agentSvcStatus.start_type)
+Write-ReportLine ("  Running?   : {0}" -f (BoolText $agentSvcStatus.running))
+
+# SQL Browser service
+$browserSvcStatus = Get-ServiceStatus -ServiceName "SQLBrowser"
+
+Write-ReportLine ""
+Write-ReportLine "SQL Browser Service:"
+Write-ReportLine ("  Exists?    : {0}" -f (BoolText $browserSvcStatus.exists))
+Write-ReportLine ("  Status     : {0}" -f $browserSvcStatus.status)
+Write-ReportLine ("  Start Type : {0}" -f $browserSvcStatus.start_type)
+Write-ReportLine ("  Running?   : {0}" -f (BoolText $browserSvcStatus.running))
+
+$JsonData.sql_services = [ordered]@{
+    sql_server_service = $sqlSvcStatus
+    sql_agent_service  = $agentSvcStatus
+    sql_browser_service = $browserSvcStatus
 }
 
-# ---------- INPUTS (print once, final) ----------
-Section "INPUTS"
-Write-ReportLine "Server Instance : $server"
-Write-ReportLine "Username        : $sqlUser"
-Write-ReportLine "Database        : $dbName"
-Write-ReportLine ("User Created?   : {0}" -f (BoolText $userCreated))
-Write-ReportLine "(Password hidden in report)"
+# ---------- SQL Remote Access ----------
+Section "SQL REMOTE ACCESS"
 
-$JsonData.inputs = [ordered]@{
-    server_instance          = $server
-    username                 = $sqlUser
-    database_name            = $dbName
-    password_provided        = $true
-    used_existing_login      = ($useExisting -match "^(y|yes)$")
-    user_created             = $(if ($userCreated) { "yes" } else { "no" })
-}
-
-# ---------- Remote Access / Agent ----------
 $remoteEnabled = $null
-$agentRunning = $false
-
-if ($sqlInstalled) {
-    Section "SQL REMOTE ACCESS / AGENT"
+if ($sqlInstalled -and $loginOK) {
     try {
         $remoteQ = "EXEC sp_configure 'remote access';"
         $remoteRes = Run-SqlQuery -ServerInstance $server -User $sqlUser -Password $sqlPass -Query $remoteQ
@@ -632,21 +715,152 @@ if ($sqlInstalled) {
         $remoteEnabled = ($remoteClean -join "`n") -match ",1$"
         Write-ReportLine ("Remote Access Enabled? : {0}" -f (BoolText $remoteEnabled))
     } catch {
-        $remoteEnabled = $null
-        Write-ReportLine "Remote Access Enabled? : UNKNOWN (login/query failed)"
+        Write-ReportLine "Remote Access Enabled? : UNKNOWN (query failed)"
     }
-
-    try {
-        $agent = Get-Service -Name "SQLSERVERAGENT" -ErrorAction SilentlyContinue
-        if ($agent -and $agent.Status -eq "Running") { $agentRunning = $true }
-    } catch { $agentRunning = $false }
-
-    Write-ReportLine ("SQL Server Agent Running? : {0}" -f (BoolText $agentRunning))
+} else {
+    Write-ReportLine "Remote Access Enabled? : UNKNOWN (not connected)"
 }
 
-$JsonData.sql_remote_access_agent = [ordered]@{
-    remote_access_enabled    = $remoteEnabled
-    sql_server_agent_running = $agentRunning
+$JsonData.sql_remote_access = [ordered]@{
+    remote_access_enabled = $remoteEnabled
+}
+
+# ---------- SQL Login / Database Checks ----------
+Section "SQL LOGIN / DATABASE CHECKS"
+
+Write-ReportLine ("Login Successful?  : {0}" -f (BoolText $loginOK))
+Write-ReportLine ("Database Exists?   : {0}" -f (BoolText $dbExists))
+Write-ReportLine ("User Created Now?  : {0}" -f (BoolText $userCreated))
+
+# Recovery Model
+$recoveryModel = "UNKNOWN"
+if ($loginOK -and $dbExists) {
+    $recoveryModel = Get-RecoveryModel -ServerInstance $server -User $sqlUser -Password $sqlPass -DbName $dbName
+    Write-ReportLine ("Recovery Model     : {0}" -f $recoveryModel)
+    
+    $recoveryOK = ($recoveryModel -eq "FULL")
+    Write-ReportLine ("Recovery Model OK for CDC? : {0}" -f (BoolText $recoveryOK))
+}
+
+$JsonData.sql_login_database = [ordered]@{
+    login_successful    = $loginOK
+    database_exists     = $dbExists
+    user_created        = $userCreated
+    recovery_model      = $recoveryModel
+    recovery_model_ok   = ($recoveryModel -eq "FULL")
+}
+
+# ---------- User Permissions ----------
+Section "USER PERMISSIONS"
+
+$serverPerms = @{ view_server_state = $false; view_any_definition = $false; is_sysadmin = $false }
+$dbRoles = @{ user_exists = $false; is_db_owner = $false; roles = @() }
+
+if ($loginOK) {
+    $serverPerms = Get-UserServerPermissions -ServerInstance $server -User $sqlUser -Password $sqlPass -LoginName $sqlUser
+    $dbRoles = Get-UserDbRole -ServerInstance $server -User $sqlUser -Password $sqlPass -DbName $dbName -LoginName $sqlUser
+    
+    Write-ReportLine "Server-Level Permissions for '$sqlUser':"
+    Write-ReportLine ("  VIEW SERVER STATE    : {0}" -f (BoolText $serverPerms.view_server_state))
+    Write-ReportLine ("  VIEW ANY DEFINITION  : {0}" -f (BoolText $serverPerms.view_any_definition))
+    Write-ReportLine ("  Is Sysadmin?         : {0}" -f (BoolText $serverPerms.is_sysadmin))
+    
+    Write-ReportLine ""
+    Write-ReportLine "Database-Level Roles for '$sqlUser' in '$dbName':"
+    Write-ReportLine ("  User Exists in DB?   : {0}" -f (BoolText $dbRoles.user_exists))
+    Write-ReportLine ("  Is db_owner?         : {0}" -f (BoolText $dbRoles.is_db_owner))
+    if ($dbRoles.roles.Count -gt 0) {
+        Write-ReportLine ("  All Roles            : {0}" -f ($dbRoles.roles -join ", "))
+    }
+}
+
+$JsonData.user_permissions = [ordered]@{
+    login_name           = $sqlUser
+    view_server_state    = $serverPerms.view_server_state
+    view_any_definition  = $serverPerms.view_any_definition
+    is_sysadmin          = $serverPerms.is_sysadmin
+    user_exists_in_db    = $dbRoles.user_exists
+    is_db_owner          = $dbRoles.is_db_owner
+    database_roles       = @($dbRoles.roles)
+}
+
+# ---------- Tables and CDC ----------
+Section "TABLES AND CDC STATUS"
+
+$tablesList = @()
+$cdcDb = $false
+$cdcTableDetails = @()
+
+if ($loginOK -and $dbExists) {
+    # Check CDC on database
+    try {
+        $cdcQ = "SELECT is_cdc_enabled FROM sys.databases WHERE name=N'$(Escape-TsqlLiteral $dbName)';"
+        $cdcRes = Run-SqlQuery -ServerInstance $server -User $sqlUser -Password $sqlPass -Query $cdcQ
+        $cdcResClean = Clean-SqlOutputLines $cdcRes
+        if ($cdcResClean -match "1") { $cdcDb = $true }
+    } catch { $cdcDb = $false }
+
+    Write-ReportLine ("CDC Enabled on Database? : {0}" -f (BoolText $cdcDb))
+    Write-ReportLine ""
+    
+    # List tables
+    Write-ReportLine "Tables:"
+    try {
+        $tq = "SELECT s.name + '.' + t.name FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id ORDER BY s.name, t.name;"
+        $tablesRaw = Run-SqlQuery -ServerInstance $server -User $sqlUser -Password $sqlPass -Database $dbName -Query $tq
+        $tablesClean = Clean-SqlOutputLines $tablesRaw
+
+        if ($tablesClean.Count -eq 0) {
+            Write-ReportLine "  (No tables found)"
+        } else {
+            foreach ($t in $tablesClean) {
+                Write-ReportLine ("  - {0}" -f $t)
+                $tablesList += $t
+            }
+        }
+    } catch {
+        Write-ReportLine "  (Failed to list tables)"
+    }
+
+    # CDC per table
+    Write-ReportLine ""
+    Write-ReportLine "CDC Enabled per Table:"
+    try {
+        $cdcTQ = "SELECT s.name + '.' + t.name AS TableName, t.is_tracked_by_cdc FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id ORDER BY TableName;"
+        $cdcRaw = Run-SqlQuery -ServerInstance $server -User $sqlUser -Password $sqlPass -Database $dbName -Query $cdcTQ
+        $cdcClean = Clean-SqlOutputLines $cdcRaw
+
+        if ($cdcClean.Count -eq 0) {
+            Write-ReportLine "  (No tables found)"
+        } else {
+            $cdcEnabledCount = 0
+            $cdcDisabledCount = 0
+            foreach ($row in $cdcClean) {
+                $parts = $row -split ","
+                if ($parts.Count -ge 2) {
+                    $tname = $parts[0].Trim()
+                    $enabled = ($parts[1].Trim() -eq "1")
+                    Write-ReportLine ("  {0} : CDC = {1}" -f $tname, (BoolText $enabled))
+                    if ($enabled) { $cdcEnabledCount++ } else { $cdcDisabledCount++ }
+                    $cdcTableDetails += [ordered]@{
+                        table_name  = $tname
+                        cdc_enabled = $enabled
+                    }
+                }
+            }
+            Write-ReportLine ""
+            Write-ReportLine ("  Summary: {0} tables with CDC enabled, {1} without" -f $cdcEnabledCount, $cdcDisabledCount)
+        }
+    } catch {
+        Write-ReportLine "  (Failed to check CDC per table)"
+    }
+}
+
+$JsonData.tables_and_cdc = [ordered]@{
+    cdc_enabled_on_database = $cdcDb
+    tables                  = @($tablesList)
+    tables_count            = $tablesList.Count
+    cdc_enabled_on_tables   = @($cdcTableDetails)
 }
 
 # ---------- Network / Firewall ----------
@@ -661,22 +875,38 @@ try {
 Write-ReportLine ("TCP Port 1433 Listening?     : {0}" -f (BoolText $portListening))
 
 $fwRuleExists = $false
+$fwRuleDetails = @()
 try {
     $rules = @(Get-NetFirewallRule -Enabled True -Direction Inbound -ErrorAction SilentlyContinue)
     foreach ($r in $rules) {
         $pf = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $r -ErrorAction SilentlyContinue
         if ($pf -and $pf.Protocol -eq "TCP" -and $pf.LocalPort -contains "1433") {
             $fwRuleExists = $true
-            break
+            $fwRuleDetails += [ordered]@{
+                name        = $r.DisplayName
+                enabled     = $r.Enabled
+                direction   = $r.Direction.ToString()
+                action      = $r.Action.ToString()
+                local_port  = $pf.LocalPort
+            }
         }
     }
 } catch { $fwRuleExists = $false }
 
 Write-ReportLine ("Firewall Inbound Rule 1433?  : {0}" -f (BoolText $fwRuleExists))
 
+if ($fwRuleDetails.Count -gt 0) {
+    Write-ReportLine ""
+    Write-ReportLine "Firewall Rules for Port 1433:"
+    foreach ($fr in $fwRuleDetails) {
+        Write-ReportLine ("  - {0} (Action: {1})" -f $fr.name, $fr.action)
+    }
+}
+
 $JsonData.network_firewall = [ordered]@{
     tcp_1433_listening         = $portListening
     firewall_inbound_rule_1433 = $fwRuleExists
+    firewall_rules             = @($fwRuleDetails)
 }
 
 # ---------- VPN Checks ----------
@@ -701,6 +931,109 @@ $JsonData.vpn_installation = [ordered]@{
     vpn_evidence = @($vpnFound)
 }
 
+# ---------- DMS Readiness Summary ----------
+Section "DMS READINESS SUMMARY"
+
+$dmsReady = $true
+$dmsIssues = @()
+
+# Check TCP/IP enabled
+$primaryNetConfig = $instanceNetworkConfigs | Where-Object { $_.instance_name -eq $primaryInstance } | Select-Object -First 1
+if (-not $primaryNetConfig.tcp_enabled) {
+    $dmsReady = $false
+    $dmsIssues += "TCP/IP is NOT enabled"
+}
+
+# Check port 1433
+if ($primaryNetConfig.tcp_port -ne "1433") {
+    $dmsReady = $false
+    $dmsIssues += "TCP Port is NOT set to 1433 (current: $($primaryNetConfig.tcp_port))"
+}
+
+# Check Mixed Mode
+if (-not $primaryNetConfig.mixed_mode_enabled) {
+    $dmsReady = $false
+    $dmsIssues += "Mixed Mode Authentication is NOT enabled"
+}
+
+# Check SQL Agent
+if (-not $agentSvcStatus.running) {
+    $dmsReady = $false
+    $dmsIssues += "SQL Server Agent is NOT running"
+}
+
+# Check Recovery Model
+if ($recoveryModel -ne "FULL") {
+    $dmsReady = $false
+    $dmsIssues += "Recovery Model is NOT FULL (current: $recoveryModel)"
+}
+
+# Check CDC on database
+if (-not $cdcDb) {
+    $dmsReady = $false
+    $dmsIssues += "CDC is NOT enabled on database"
+}
+
+# Check firewall
+if (-not $fwRuleExists) {
+    $dmsReady = $false
+    $dmsIssues += "No firewall inbound rule for port 1433"
+}
+
+# Check port listening
+if (-not $portListening) {
+    $dmsReady = $false
+    $dmsIssues += "Port 1433 is NOT listening"
+}
+
+# Check user permissions
+if (-not $serverPerms.is_sysadmin -and (-not $serverPerms.view_server_state -or -not $serverPerms.view_any_definition)) {
+    $dmsReady = $false
+    $dmsIssues += "User missing server permissions (VIEW SERVER STATE / VIEW ANY DEFINITION)"
+}
+
+if (-not $dbRoles.is_db_owner) {
+    $dmsReady = $false
+    $dmsIssues += "User is NOT db_owner in database"
+}
+
+Write-ReportLine ""
+Write-ReportLine ("DMS Ready? : {0}" -f (BoolText $dmsReady))
+Write-ReportLine ""
+
+if ($dmsReady) {
+    Write-ReportLine "All DMS prerequisites are met!"
+} else {
+    Write-ReportLine "Issues Found:"
+    foreach ($issue in $dmsIssues) {
+        Write-ReportLine ("  - {0}" -f $issue)
+    }
+    Write-ReportLine ""
+    Write-ReportLine "Run Prepare-MSSQL-SourceForDMS.ps1 to fix these issues."
+}
+
+$JsonData.dms_readiness = [ordered]@{
+    dms_ready  = $dmsReady
+    issues     = @($dmsIssues)
+}
+
+# ---------- Inputs Summary ----------
+Section "INPUTS SUMMARY"
+Write-ReportLine "Server Instance : $server"
+Write-ReportLine "Username        : $sqlUser"
+Write-ReportLine "Database        : $dbName"
+Write-ReportLine ("User Created?   : {0}" -f (BoolText $userCreated))
+Write-ReportLine "(Password hidden in report)"
+
+$JsonData.inputs = [ordered]@{
+    server_instance     = $server
+    username            = $sqlUser
+    database_name       = $dbName
+    password_provided   = $true
+    used_existing_login = ($useExisting -match "^(y|yes)$")
+    user_created        = $userCreated
+}
+
 # ---------- Save Report + JSON ----------
 Section "REPORT OUTPUT"
 $docPath = Join-Path $env:USERPROFILE "Documents"
@@ -708,14 +1041,14 @@ $outTxt = Join-Path $docPath "System_details.txt"
 $outJson = Join-Path $docPath "System_details.json"
 
 try {
-    $Report | Out-File -FilePath $outTxt -Encoding UTF8 -Force
+    $script:Report | Out-File -FilePath $outTxt -Encoding UTF8 -Force
     Write-ReportLine "Report saved to: $outTxt"
 } catch {
     Write-ReportLine "Failed to write TXT report."
 }
 
 try {
-    $JsonData | ConvertTo-Json -Depth 8 | Out-File -FilePath $outJson -Encoding UTF8 -Force
+    $JsonData | ConvertTo-Json -Depth 10 | Out-File -FilePath $outJson -Encoding UTF8 -Force
     Write-ReportLine "JSON saved to:   $outJson"
 } catch {
     Write-ReportLine "Failed to write JSON report."
