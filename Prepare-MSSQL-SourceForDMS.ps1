@@ -449,7 +449,16 @@ END
 
     # Optionally append sysadmin block from PowerShell to avoid embedding PowerShell expressions in the here-string
     if ($GrantSysadmin) {
-        $sql += "`r`nIF NOT EXISTS (SELECT 1 FROM sys.server_role_members rm JOIN sys.server_principals r ON rm.role_principal_id=r.principal_id JOIN sys.server_principals p ON rm.member_principal_id=p.principal_id WHERE r.name='sysadmin' AND p.name=N'$safeUser')\nBEGIN\n    ALTER SERVER ROLE [sysadmin] ADD MEMBER [$safeUser];\n    PRINT '  ✓ Added to sysadmin role: $safeUser';\nEND\nELSE\n    PRINT '  ✓ Already member of sysadmin role: $safeUser';\n"
+        $sysadminBlock = @"
+IF NOT EXISTS (SELECT 1 FROM sys.server_role_members rm JOIN sys.server_principals r ON rm.role_principal_id=r.principal_id JOIN sys.server_principals p ON rm.member_principal_id=p.principal_id WHERE r.name='sysadmin' AND p.name=N'$safeUser')
+BEGIN
+    ALTER SERVER ROLE [sysadmin] ADD MEMBER [$safeUser];
+    PRINT '  OK Added to sysadmin role: $safeUser';
+END
+ELSE
+    PRINT '  OK Already member of sysadmin role: $safeUser';
+"@
+        $sql += "`r`n" + $sysadminBlock
     }
 
     # Write to temporary file and execute in master context
