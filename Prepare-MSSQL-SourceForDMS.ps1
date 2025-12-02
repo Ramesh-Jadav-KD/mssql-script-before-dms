@@ -677,14 +677,15 @@ Write-Host "========================================" -ForegroundColor Yellow
 $scriptDir = Get-ScriptDir
 $sqlScriptPath = Join-Path $scriptDir 'Setup-DMS-Complete.sql'
 
-# If DMS username/password not provided via CLI, prompt now (secure)
+# If the DMS login was already created earlier (for example by System_Details_Check.ps1)
+# re-use the existing login entered during the main prompt. This avoids asking twice.
 if (-not $DmsUsername) {
-    $entered = Read-Host "Enter DMS username to create (leave blank to skip creating a DMS login)"
-    if ($entered) { $DmsUsername = $entered }
+    $DmsUsername = $cred.Login
+    Write-Info "No DMS username provided on CLI — using existing login from earlier prompt: $DmsUsername"
 }
-if ($DmsUsername -and -not $DmsPassword) {
-    $dmsPwdSecure = Read-Host "Enter password for DMS user $DmsUsername" -AsSecureString
-    $DmsPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($dmsPwdSecure))
+# Default DMS password to the password entered earlier for the same login if not supplied
+if (-not $DmsPassword) {
+    $DmsPassword = $cred.Password
 }
 
 # If user requested, create the DMS server login now

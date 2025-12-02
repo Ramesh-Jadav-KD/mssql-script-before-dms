@@ -259,48 +259,111 @@ function Test-DbExists-WindowsAuth {
 
 # --- Ensure login, user, sysadmin + db_owner using Windows auth ---
 function Ensure-LoginAndGrants-WindowsAuth {
+    <#
+    Ensures a SQL login exists and a database user is mapped and granted appropriate DB role.
+
+    Parameters:
+      -ServerInstance  : SQL Server instance name
+      -DbName          : Target database name
+      -Login           : Login name to create/use
+      -Password        : Password for new login (only used when creating)
+      -MakeSysAdmin    : If $true, adds the login to sysadmin. Default $false.
+      -GrantDbOwner    : If $true, adds the DB user to db_owner. Default $true.
+
+    Behavior:
+      - Creates login if missing (with CHECK_POLICY/CHECK_EXPIRATION OFF)
+      - By default grants minimal server perms required for many read operations
+        (VIEW SERVER STATE and VIEW ANY DEFINITION). Use -MakeSysAdmin to add
+        to sysadmin instead.
+      - Creates the database user mapped to the login if missing and optionally
+        adds it to db_owner so it can enable CDC and perform schema operations.
+    #>
+
     param(
         [string]$ServerInstance,
         [string]$DbName,
         [string]$Login,
-        [string]$Password
+        [string]$Password,
+        [switch]$MakeSysAdmin,
+        [switch]$GrantDbOwner
     )
 
+    if ($null -eq $GrantDbOwner) { $GrantDbOwner = $true }
+    if ($null -eq $MakeSysAdmin) { $MakeSysAdmin = $false }
+
+    # Escape literals safely for embedding into T-SQL string
     $l = Escape-TsqlLiteral $Login
     $p = Escape-TsqlLiteral $Password
     $db = Escape-TsqlLiteral $DbName
 
-    $q = @"
-IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'$l')
-BEGIN
-    CREATE LOGIN [$l] WITH PASSWORD = N'$p', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;
-END
+    # Build server-level T-SQL to run in master for login creation and server perms
+    $srvBlocks = @()
 
--- grant sysadmin (full server perms)
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.server_role_members rm
-    JOIN sys.server_principals r ON rm.role_principal_id = r.principal_id
-    JOIN sys.server_principals m ON rm.member_principal_id = m.principal_id
-    WHERE r.name='sysadmin' AND m.name=N'$l'
-)
-BEGIN
-    ALTER SERVER ROLE [sysadmin] ADD MEMBER [$l];
-END
+    $srvBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'$l')"
+    $srvBlocks += "BEGIN"
+    if ([string]::IsNullOrEmpty($Password)) {
+        # If no password supplied, create a login without password (Windows login) - but we expect SQL login
+        $srvBlocks += "    -- No password supplied; skipping CREATE LOGIN because password empty"
+    } else {
+        $srvBlocks += "    CREATE LOGIN [" + $l + "] WITH PASSWORD = N'$p', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;"
+    }
+    $srvBlocks += "END"
 
-USE [$db];
-IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'$l')
-BEGIN
-    CREATE USER [$l] FOR LOGIN [$l];
-END
-ALTER ROLE [db_owner] ADD MEMBER [$l];
-"@
+    if ($MakeSysAdmin) {
+        $srvBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.server_role_members rm JOIN sys.server_principals r ON rm.role_principal_id = r.principal_id JOIN sys.server_principals m ON rm.member_principal_id = m.principal_id WHERE r.name='sysadmin' AND m.name=N'$l')"
+        $srvBlocks += "BEGIN"
+        $srvBlocks += "    ALTER SERVER ROLE [sysadmin] ADD MEMBER [" + $l + "];"
+        $srvBlocks += "END"
+    }
+    else {
+        # Grant minimal server-level permissions useful for discovery and CDC operations
+        $srvBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.server_permissions sp JOIN sys.server_principals p ON sp.grantee_principal_id = p.principal_id WHERE p.name = N'$l' AND sp.permission_name = 'VIEW SERVER STATE')"
+        $srvBlocks += "BEGIN"
+        $srvBlocks += "    GRANT VIEW SERVER STATE TO [" + $l + "];"
+        $srvBlocks += "END"
 
+        $srvBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.server_permissions sp JOIN sys.server_principals p ON sp.grantee_principal_id = p.principal_id WHERE p.name = N'$l' AND sp.permission_name = 'VIEW ANY DEFINITION')"
+        $srvBlocks += "BEGIN"
+        $srvBlocks += "    GRANT VIEW ANY DEFINITION TO [" + $l + "];"
+        $srvBlocks += "END"
+    }
+
+    $srvSql = ($srvBlocks -join "`r`n")
+
+    # Build DB-level T-SQL (run in the target DB)
+    $dbBlocks = @()
+    $dbBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'$l')"
+    $dbBlocks += "BEGIN"
+    $dbBlocks += "    CREATE USER [" + $l + "] FOR LOGIN [" + $l + "];"
+    $dbBlocks += "END"
+    if ($GrantDbOwner) {
+        $dbBlocks += "IF NOT EXISTS (SELECT 1 FROM sys.database_role_members drm JOIN sys.database_principals r ON drm.role_principal_id = r.principal_id JOIN sys.database_principals m ON drm.member_principal_id = m.principal_id WHERE r.name = 'db_owner' AND m.name = N'$l')"
+        $dbBlocks += "BEGIN"
+        $dbBlocks += "    ALTER ROLE [db_owner] ADD MEMBER [" + $l + "];"
+        $dbBlocks += "END"
+    }
+
+    $dbSql = ($dbBlocks -join "`r`n")
+
+    # Make a safe USE [dbname] prefix (escape any ']' inside name by doubling)
+    $safeDb = $DbName -replace ']', ']]'
+    $usePrefix = "USE [" + $safeDb + "];`r`n"
+    $dbSqlFull = $usePrefix + $dbSql
+
+    # Execute server-level block in master first, then DB-level block in the target DB
     try {
-        sqlcmd -S $ServerInstance -E -Q $q | Out-Null
+        # run server-level in master
+        sqlcmd -S $ServerInstance -E -d master -Q $srvSql | Out-Null
+
+        # run db-level by prefixing USE [dbname] to the batch (avoids -d quoting issues)
+        sqlcmd -S $ServerInstance -E -Q $dbSqlFull | Out-Null
+
         return $true
     }
-    catch { return $false }
+    catch {
+        Write-Host "Ensure-LoginAndGrants-WindowsAuth failed: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 # ---------- Start ----------
